@@ -215,18 +215,12 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
 
     /*** Policy Hooks ***/
 
-    /**
-     * @notice Checks if the account should be allowed to mint tokens in the given market
-     * @param cToken The market to verify the mint against
-     * @param minter The account which would get the minted tokens
-     * @param mintAmount The amount of underlying being supplied to the market in exchange for tokens
-     * @return 0 if the mint is allowed, otherwise a semi-opaque error code (See ErrorReporter.sol)
-     */
+    // 检查是否应允许帐户在给定市场中铸造代币
+    // 返回：如果允许铸造，则为返回 0，否则为半不透明错误代码（请参阅 ErrorReporter.sol）
     function mintAllowed(address cToken, address minter, uint mintAmount) override external returns (uint) {
-        // Pausing is a very serious situation - we revert to sound the alarms
+        // 检查 市场级别 是否被暂停，如果是，抛出异常
         require(!mintGuardianPaused[cToken], "mint is paused");
 
-        // Shh - currently unused
         minter;
         mintAmount;
 
@@ -234,8 +228,9 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
             return uint(Error.MARKET_NOT_LISTED);
         }
 
-        // Keep the flywheel moving
+        // COMP治理代币 奖励分发
         updateCompSupplyIndex(cToken);
+        // 用户应得 COMP = 用户持有 cToken × (当前指数 - 用户上次快照指数)
         distributeSupplierComp(cToken, minter);
 
         return uint(Error.NO_ERROR);
@@ -261,27 +256,21 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         }
     }
 
-    /**
-     * @notice Checks if the account should be allowed to redeem tokens in the given market
-     * @param cToken The market to verify the redeem against
-     * @param redeemer The account which would redeem the tokens
-     * @param redeemTokens The number of cTokens to exchange for the underlying asset in the market
-     * @return 0 if the redeem is allowed, otherwise a semi-opaque error code (See ErrorReporter.sol)
-     */
+    // 检查账户是否允许在给定市场赎回代币
     function redeemAllowed(address cToken, address redeemer, uint redeemTokens) override external returns (uint) {
         uint allowed = redeemAllowedInternal(cToken, redeemer, redeemTokens);
         if (allowed != uint(Error.NO_ERROR)) {
             return allowed;
         }
 
-        // Keep the flywheel moving
+        // COMP 奖励分发
         updateCompSupplyIndex(cToken);
         distributeSupplierComp(cToken, redeemer);
 
         return uint(Error.NO_ERROR);
     }
 
-    // 内部函数：检查账户是否允许在给定市场赎回代币
+    // 内部函数：健康度查询：检查账户是否允许在给定市场赎回代币
     function redeemAllowedInternal(address cToken, address redeemer, uint redeemTokens) internal view returns (uint) {
         // 市场是否上架
         if (!markets[cToken].isListed) {
@@ -596,7 +585,7 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
     // 参数：cToken：市场核实转让、src：源账户、dst：目标账户、transferTokens：转让的cToken数量
     // 如果允许转账，则为 0，否则为半透明错误代码（请参阅 ErrorReporter.sol）
     function transferAllowed(address cToken, address src, address dst, uint transferTokens) override external returns (uint) {
-        // 1、检查市场是否被暂停，如果是，抛出异常。  为什么要设置一个市场停止功能？答：设置这个功能是为了维持系统稳定，让用户有更多时间来应对市场波动，以保证用户的资金安全。
+        // 1、检查 全局转账 是否被暂停，如果是，抛出异常。  为什么要设置一个市场停止功能？答：设置这个功能是为了维持系统稳定，让用户有更多时间来应对市场波动，以保证用户的资金安全。
         // 暂停是一种非常严重的情况 -我们恢复拉响警报
         require(!transferGuardianPaused, "transfer is paused");
 
@@ -1145,35 +1134,13 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         }
     }
 
-    /**
-     * @notice Accrue COMP to the market by updating the borrow index
-     * @param cToken The market whose borrow index to update
-     */
-    function updateCompBorrowIndex(address cToken, Exp memory marketBorrowIndex) internal {
-        CompMarketState storage borrowState = compBorrowState[cToken];
-        uint borrowSpeed = compSpeeds[cToken];
-        uint blockNumber = getBlockNumber();
-        uint deltaBlocks = sub_(blockNumber, uint(borrowState.block));
-        if (deltaBlocks > 0 && borrowSpeed > 0) {
-            uint borrowAmount = div_(CToken(cToken).totalBorrows(), marketBorrowIndex);
-            uint compAccrued = mul_(deltaBlocks, borrowSpeed);
-            Double memory ratio = borrowAmount > 0 ? fraction(compAccrued, borrowAmount) : Double({mantissa: 0});
-            Double memory index = add_(Double({mantissa: borrowState.index}), ratio);
-            compBorrowState[cToken] = CompMarketState({
-                index: safe224(index.mantissa, "new index exceeds 224 bits"),
-                block: safe32(blockNumber, "block number exceeds 32 bits")
-            });
-        } else if (deltaBlocks > 0) {
-            borrowState.block = safe32(blockNumber, "block number exceeds 32 bits");
-        }
-    }
-
-    /**
+     /**
      * @notice 计算供应商累积的 COMP 并可能将其转移给他们
      * @param cToken The market in which the supplier is interacting
      * @param supplier The address of the supplier to distribute COMP to
      */
     // 为发送方分发 COMP 奖励
+    // 用户应得 COMP = 用户持有 cToken × (当前指数 - 用户上次快照指数)
     function distributeSupplierComp(address cToken, address supplier) internal {
         // 获取市场的供应状态
         CompMarketState storage supplyState = compSupplyState[cToken];
@@ -1199,6 +1166,29 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         uint supplierAccrued = add_(compAccrued[supplier], supplierDelta);
         compAccrued[supplier] = supplierAccrued;
         emit DistributedSupplierComp(CToken(cToken), supplier, supplierDelta, supplyIndex.mantissa);
+    }
+
+    /**
+     * @notice Accrue COMP to the market by updating the borrow index
+     * @param cToken The market whose borrow index to update
+     */
+    function updateCompBorrowIndex(address cToken, Exp memory marketBorrowIndex) internal {
+        CompMarketState storage borrowState = compBorrowState[cToken];
+        uint borrowSpeed = compSpeeds[cToken];
+        uint blockNumber = getBlockNumber();
+        uint deltaBlocks = sub_(blockNumber, uint(borrowState.block));
+        if (deltaBlocks > 0 && borrowSpeed > 0) {
+            uint borrowAmount = div_(CToken(cToken).totalBorrows(), marketBorrowIndex);
+            uint compAccrued = mul_(deltaBlocks, borrowSpeed);
+            Double memory ratio = borrowAmount > 0 ? fraction(compAccrued, borrowAmount) : Double({mantissa: 0});
+            Double memory index = add_(Double({mantissa: borrowState.index}), ratio);
+            compBorrowState[cToken] = CompMarketState({
+                index: safe224(index.mantissa, "new index exceeds 224 bits"),
+                block: safe32(blockNumber, "block number exceeds 32 bits")
+            });
+        } else if (deltaBlocks > 0) {
+            borrowState.block = safe32(blockNumber, "block number exceeds 32 bits");
+        }
     }
 
     /**

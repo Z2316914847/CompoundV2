@@ -62,6 +62,7 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
     // 通过 `spender` 将 `tokens` 代币从 `src` 转移到 `dst`
     // 参数：spender：实际执行转账操作的地址（调用者）、src：代币来源地址（发送方）、dst：目标账户的地址、tokens：要传输的代币数量
     function transferTokens(address spender, address src, address dst, uint tokens) internal returns (uint) {
+        // 权限检查 - 转账
         // 进行权限检查目的：
         //   1、检查市场是否被暂停，停止的话，就不让转账。
         //   2、检查转账后，账户抵押率是否健康，健康的话，就让转账，反之，不让账户转账。💧
@@ -157,28 +158,26 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
     // 参数：mintAmount 提供的基础资产数量
     function mintInternal(uint mintAmount) internal nonReentrant {
         accrueInterest();
-        // mintFresh emits the actual Mint event if successful and logs on errors, so we don't need to
         mintFresh(msg.sender, mintAmount);
     }
 
     // 铸造 CToken
     function mintFresh(address minter, uint mintAmount) internal {
-        // 1、验证是否允许存款
+        // 1、权限检查 - 铸造
         uint allowed = comptroller.mintAllowed(address(this), minter, mintAmount);
         if (allowed != 0) {
             revert MintComptrollerRejection(allowed);
         }
 
-        // 2、新鲜度检查：验证市场的区块号等于当前区块号
+        // 2、验证市场的区块号 等于 当前区块号。前面的 accrueInterest 已经更新了区块号，为什么这里还要检查？
+        //   因为用户铸造代币时，调用 accrueInterest函数，accrualBlockNumber肯不会更新。具体原因看这个函数代码。
         if (accrualBlockNumber != getBlockNumber()) {
             revert MintFreshnessCheck();
         }
 
         Exp memory exchangeRate = Exp({mantissa: exchangeRateStoredInternal()});
 
-        /////////////////////////
-        // 效果与相互作用
-        // （超出此点没有安全故障）
+        // 遵循 检查-效果-交互模式
 
         /*
          *我们为铸币者和铸币金额调用“doTransferIn”。
@@ -224,7 +223,6 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
     // 按 CToken 数量赎回：销毁指定数量的 CToken，赎回底层资产
     function redeemInternal(uint redeemTokens) internal nonReentrant {
         accrueInterest();
-        // redeemFresh emits redeem-specific logs on errors, so we don't need to
         redeemFresh(payable(msg.sender), redeemTokens, 0);
     }
 
@@ -240,59 +238,46 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
     function redeemFresh(address payable redeemer, uint redeemTokensIn, uint redeemAmountIn) internal {
         require(redeemTokensIn == 0 || redeemAmountIn == 0, "one of redeemTokensIn or redeemAmountIn must be zero");
 
-        // 1、ExchangeRate = 调用 Exchange Rate Stored() 
+        // 1、获取兑换率
         Exp memory exchangeRate = Exp({mantissa: exchangeRateStoredInternal() });
 
-        // 2、计算赎回量
+        // 2、计算 赎回底层资产
         uint redeemTokens;
         uint redeemAmount;
         if (redeemTokensIn > 0) {
-            /*
-             * We calculate the exchange rate and the amount of underlying to be redeemed:
-             *  redeemTokens = redeemTokensIn
-             *  redeemAmount = redeemTokensIn x exchangeRateCurrent
-             */
-            // 如果指定了 CToken 数量
+            // 按 CToken 数量赎回
             redeemTokens = redeemTokensIn;
             redeemAmount = mul_ScalarTruncate(exchangeRate, redeemTokensIn);
         } else {
-            /*
-             * We get the current exchange rate and calculate the amount to be redeemed:
-             *  redeemTokens = redeemAmountIn / exchangeRate
-             *  redeemAmount = redeemAmountIn
-             */
-            // 如果指定了底层资产数量
+            // 按 底层资产 数量赎回
             redeemTokens = div_(redeemAmountIn, exchangeRate);
             redeemAmount = redeemAmountIn;
         }
 
-        // 3、权限检查
+        // 3、权限检查 - 赎回：这里只检查用户健康度，没有检查暂停这一项，因为赎回不能被停止。
+        //   有人会问，为什么这里 权限检查 在中间，而不是在 顶部。答：因为这里权限检查需要知道 CToken赎回的数量（注意不是底层资产）。其实这里也算顶部
         uint allowed = comptroller.redeemAllowed(address(this), redeemer, redeemTokens);
         if (allowed != 0) {
             revert RedeemComptrollerRejection(allowed);
         }
 
-        // 4、流动性检查
-        /* Verify market's block number equals current block number */
         if (accrualBlockNumber != getBlockNumber()) {
+            // 确保区块时最新的
             revert RedeemFreshnessCheck();
         }
 
-        /* Fail gracefully if protocol has insufficient cash */
         if (getCashPrior() < redeemAmount) {
+            // 协议现金不足
             revert RedeemTransferOutNotPossible();
         }
 
-        /////////////////////////
-        // 效果与相互作用
-        // （超出此点没有安全故障）
-
+        // 遵循 检查-效果-交互模式
 
         /*
          *我们将之前计算的值写入存储中。
          *  注意：通过在外部传输之前写入减少的供应量来避免代币重入攻击。
          */
-        // 5、更新状态
+        // 4、更新状态
         totalSupply = totalSupply - redeemTokens;
         accountTokens[redeemer] = accountTokens[redeemer] - redeemTokens;
 
@@ -302,10 +287,10 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
          *成功后，cToken 的赎回金额会少于现金。
          *如果出现任何问题，doTransferOut 会恢复，因为我们无法确定是否发生了副作用。
          */
-        // 6、转出资产
+        // 5、转出资产
         doTransferOut(redeemer, redeemAmount);
 
-        // 7、触发事件
+        // 6、触发事件
         emit Transfer(redeemer, address(this), redeemTokens);
         emit Redeem(redeemer, redeemAmount, redeemTokens);
 
@@ -660,7 +645,7 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
     function exchangeRateCurrent() override public nonReentrant returns (uint) {
         // 更新最新区块号, 最新借贷指数, 最新借贷总额, 最新储备金
         //   我获取最新兑换率, 为什么还要更新其他数据? 答: 因为最新兑换率中使用到了 底层资产, 借贷总额, 储备金, 所以要将这些数据更新 
-        //   更新三项即可, 为什么还要更新区块号? 答: 因为这 累计利息 涉及到 最新区块号，所以要更新最新区块号。
+        //   更新两项即可, 为什么还要更新区块号和最新借贷指数? 答: 更新最新区块，是因为用户可能在 同一个区块反复查询，所以要更新区块号，避免重复计算。更新最新借贷指数，是因为 用于计算每个人实际借款应计利息。
         //   计算这段时间的利率 = 这段时间的区号数 * 每个区块的利率
         accrueInterest();
         // 返回兑换率

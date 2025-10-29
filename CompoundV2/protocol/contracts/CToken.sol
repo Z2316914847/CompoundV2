@@ -52,6 +52,7 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
     // =============================================================================================
 
     // 将 CToken 从调用者转账到目标地址
+    // 参数：dst 目标地址、amount 要转账的代币数量
     function transfer(address dst, uint256 amount) override external nonReentrant returns (bool) {
         // 为什么是四个参数？答：一个函数处理两种转账场景（普通转账、被授权人使用津贴进行转账）、明确区分调用者和发送方
         // 第一个参数：实际执行转账操作的地址（调用者）
@@ -179,15 +180,7 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
 
         // 遵循 检查-效果-交互模式
 
-        /*
-         *我们为铸币者和铸币金额调用“doTransferIn”。
-         *  注意：cToken 必须处理 ERC-20 和 ETH 底层之间的差异。
-         *如果出现任何问题，`doTransferIn` 会恢复，因为我们无法确定是否
-         *发生副作用。该函数返回实际转账的金额，
-         *如果需要付费。成功后，cToken 会持有额外的“actualMintAmount”
-         *现金。
-         */
-        // 3、转入资产：从用户转入底层资产
+        // 3、转入底层资产
         uint actualMintAmount = doTransferIn(minter, mintAmount);
 
         /*
@@ -281,13 +274,9 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
         totalSupply = totalSupply - redeemTokens;
         accountTokens[redeemer] = accountTokens[redeemer] - redeemTokens;
 
-        /*
-         *我们为赎回者和赎回金额调用 doTransferOut。
-         *  注意：cToken 必须处理 ERC-20 和 ETH 底层之间的差异。
-         *成功后，cToken 的赎回金额会少于现金。
-         *如果出现任何问题，doTransferOut 会恢复，因为我们无法确定是否发生了副作用。
-         */
-        // 5、转出资产
+        // 5、转出底层资产
+        //   如果要赎回ETH，则调用者会收到ETH
+        //   如果要赎回ERC-20代币，则调用者会收到ERC-20代币
         doTransferOut(redeemer, redeemAmount);
 
         // 6、触发事件
@@ -303,43 +292,37 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
     // =============================================================================================
 
     // 借款入口：从协议借出底层资产
+    // 参数：borrowAmount：是要借的底层资产数量
     function borrowInternal(uint borrowAmount) internal nonReentrant {
         accrueInterest();
-        // borrowFresh 会发出特定于借用的错误日志，因此我们不需要
         borrowFresh(payable(msg.sender), borrowAmount);
     }
 
     // 借款核心逻辑
     function borrowFresh(address payable borrower, uint borrowAmount) internal {
-        // 权限检查
+        // 权限检查 - 借贷
         uint allowed = comptroller.borrowAllowed(address(this), borrower, borrowAmount);
         if (allowed != 0) {
             revert BorrowComptrollerRejection(allowed);
         }
 
-        /* Verify market's block number equals current block number */
         if (accrualBlockNumber != getBlockNumber()) {
             revert BorrowFreshnessCheck();
         }
 
-        /* Fail gracefully if protocol has insufficient underlying cash */
         if (getCashPrior() < borrowAmount) {
             revert BorrowCashNotAvailable();
         }
 
-        /*
-         *我们计算新借款人和总借款余额，溢出失败：
-         *accountBorrowNew = accountBorrow + 借入金额
-         *借入总额 = 借入总额 + 借入金额
-         */
-        // 计算新记账
+        // 计算新记账：借入总额 = 借入总额 + 借入金额
+        //   获取用户最新借款余额（不含这次借贷数量）
         uint accountBorrowsPrev = borrowBalanceStoredInternal(borrower);
+        //   计算新的用户总借款金额（含这次借贷数量）
         uint accountBorrowsNew = accountBorrowsPrev + borrowAmount;
+        //   更新市场总借款金额
         uint totalBorrowsNew = totalBorrows + borrowAmount;
 
-        /////////////////////////
-        // EFFECTS & INTERACTIONS
-        // (No safe failures beyond this point)
+        // 遵循 检查-效果-交互模式
         
         /*
          *我们将之前计算的值写入存储中。
@@ -350,13 +333,7 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
         accountBorrows[borrower].interestIndex = borrowIndex;
         totalBorrows = totalBorrowsNew;
 
-        /*
-         *我们为借款人和借用金额调用 doTransferOut。
-         *  注意：cToken 必须处理 ERC-20 和 ETH 底层之间的差异。
-         *成功后，cToken 借入金额减去现金。
-         *如果出现任何问题，doTransferOut 会恢复，因为我们无法确定是否发生了副作用。
-         */
-        // 转出资产
+        // 转出底层资产 
         doTransferOut(borrower, borrowAmount);
 
         // 触发事件
@@ -367,15 +344,15 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
     //                                 五；偿还借款（Repay Borrow）模块
     // =============================================================================================
 
-    // 还是自己的款
+    // 自己还借贷
     // 参数：repayAmount 要偿还的金额，或 -1 表示全部未偿还金额
     function repayBorrowInternal(uint repayAmount) internal nonReentrant {
         accrueInterest();
-        // repayBorrowFresh 会发出特定于还款借用的错误日志，因此我们不需要
         repayBorrowFresh(msg.sender, msg.sender, repayAmount);
     }
 
-    // 代他人还款
+    // 替踢人还借贷
+    // 参数：borrower 要偿还的借款人地址、repayAmount 要偿还的金额( -1 表示全部未偿还金额)
     function repayBorrowBehalfInternal(address borrower, uint repayAmount) internal nonReentrant {
         accrueInterest();
         repayBorrowFresh(msg.sender, borrower, repayAmount);
@@ -389,30 +366,18 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
             revert RepayBorrowComptrollerRejection(allowed);
         }
 
-        /* Verify market's block number equals current block number */
         if (accrualBlockNumber != getBlockNumber()) {
             revert RepayBorrowFreshnessCheck();
         }
 
-        // 我们获取借款人所欠金额以及累积利息 
-        // 计算还款额
-        // 借款人当前欠款
+        // 获取最新借款人所欠金额以及累积利息 = 还款总额 
         uint accountBorrowsPrev = borrowBalanceStoredInternal(borrower);
 
         // 如果 repayAmount == -1, repayAmount = accountBorrows
         uint repayAmountFinal = repayAmount == type(uint).max ? accountBorrowsPrev : repayAmount;
 
-        /////////////////////////
-        // 效果与相互作用
-        // （超出此点没有安全故障）
+        // 遵循 检查-效果-交互模式
 
-        /*
-         *我们为付款人和 repayAmount 调用 doTransferIn
-         *  注意：cToken 必须处理 ERC-20 和 ETH 底层之间的差异。
-         *成功后，cToken 会持有额外的还款金额现金。
-         *如果出现任何问题，doTransferIn 就会恢复，因为我们无法确定是否发生了副作用。
-         *如果需要付费，则返回实际转账的金额。
-         */
         // 转入资产
         uint actualRepayAmount = doTransferIn(payer, repayAmountFinal);
 
@@ -439,39 +404,36 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
     // =============================================================================================
 
     // 清算入口
-    // 参数：borrower 要清算的借款人地址、repayAmount 偿还的借款金额、cTokenCollateral 用作抵押品的 cToken 市场/地址
+    // 参数：borrower：要清算的借款人地址、repayAmount：偿还的借款金额、cTokenCollateral：抵押品的 cToken 市场/地址
     function liquidateBorrowInternal(address borrower, uint repayAmount, CTokenInterface cTokenCollateral) internal nonReentrant {
         accrueInterest();
 
+        // 为什么这里又执行一次更新 累计利息
         uint error = cTokenCollateral.accrueInterest();
         if (error != NO_ERROR) {
-            // accrueInterest 发出错误日志，但我们仍然想记录尝试清算失败的事实
             revert LiquidateAccrueCollateralInterestFailed(error);
         }
 
-        // LiquidateBorrowFresh 会发出特定于借用的错误日志，因此我们不需要
         liquidateBorrowFresh(msg.sender, borrower, repayAmount, cTokenCollateral);
     }
 
     // 清算核心逻辑
+    // 参数：liquidator 清算人地址、borrower 要清算的借款人地址、repayAmount 偿还的借款金额、cTokenCollateral 用作抵押品的 cToken 市场/地址
     function liquidateBorrowFresh(address liquidator, address borrower, uint repayAmount, CTokenInterface cTokenCollateral) internal {
-        // 1、权限检查
+        // 1、权限检查 - 清算
         uint allowed = comptroller.liquidateBorrowAllowed(address(this), address(cTokenCollateral), liquidator, borrower, repayAmount);
         if (allowed != 0) {
             revert LiquidateComptrollerRejection(allowed);
         }
 
-        /* Verify market's block number equals current block number */
         if (accrualBlockNumber != getBlockNumber()) {
             revert LiquidateFreshnessCheck();
         }
 
-        /* Verify cTokenCollateral market's block number equals current block number */
         if (cTokenCollateral.accrualBlockNumber() != getBlockNumber()) {
             revert LiquidateCollateralFreshnessCheck();
         }
 
-        // 2、验证条件：不能自我清算、 还款金额 不能为 0 && 不能为 -1
         if (borrower == liquidator) {
             revert LiquidateLiquidatorIsBorrower();
         }
@@ -484,22 +446,22 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
             revert LiquidateCloseAmountIsUintMax();
         }
 
-        // 3、代偿债务
+        // 2、得到实际偿还额
         uint actualRepayAmount = repayBorrowFresh(liquidator, borrower, repayAmount);
 
         /////////////////////////
         // 效果与相互作用
         // （超出此点没有安全故障）
 
-        // 4、计算清算获得
-        // 我们计算将被扣押的抵押代币数量
+        // 3、计算清算获得
+        //   计算将被扣押的 抵押 ctoken代币 数量
         (uint amountSeizeError, uint seizeTokens) = comptroller.liquidateCalculateSeizeTokens(address(this), address(cTokenCollateral), actualRepayAmount);
         require(amountSeizeError == NO_ERROR, "LIQUIDATE_COMPTROLLER_CALCULATE_AMOUNT_SEIZE_FAILED");
 
         // 如果借款人抵押代币余额 < acquireTokens 则恢复 
         require(cTokenCollateral.balanceOf(borrower) >= seizeTokens, "LIQUIDATE_SEIZE_TOO_MUCH");
 
-        // 5、执行扣押：如果这也是抵押品，请运行 acquireInternal 以避免重入，否则进行外部调用
+        // 4、执行扣押
         if (address(cTokenCollateral) == address(this)) {
             seizeInternal(address(this), liquidator, borrower, seizeTokens);
         } else {
@@ -517,23 +479,17 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
     //  * @param 借款人 已扣押抵押品的账户
     //  * @param acquireTokens 要抢占的 cToken 数量
     //  * @return uint 0=成功，否则失败（详情参见ErrorReporter.sol）
-    // 扣押抵押品
+    // 扣押抵押品 - 外部市场
     function seize(address liquidator, address borrower, uint seizeTokens) override external nonReentrant returns (uint) {
         seizeInternal(msg.sender, liquidator, borrower, seizeTokens);
 
         return NO_ERROR;
     }
 
-    //  将抵押代币（本市场）转移给清算人。
-    //  * @dev 仅在实物清算期间调用，或在另一个 CToken 清算期间由 LiquidateBorrow 调用。
-    //  *使用 msg.sender 作为抢占器 cToken 而不是参数绝对至关重要。
-    //  * @param acquirerToken 扣押抵押品的合约（即借来的 cToken）
-    //  * @param Liquidator 接收扣押抵押品的账户
-    //  * @param 借款人 已扣押抵押品的账户
-    //  * @param seizeTokens The number of cTokens to seize
-    // 扣押抵押品
+    // 扣押抵押品 - 本市场
+    // 参数：seizerToken 扣押抵押品的合约、liquidator：清算人地址、borrower：借贷人地址、seizeTokens 被扣押的 cToken 数量
     function seizeInternal(address seizerToken, address liquidator, address borrower, uint seizeTokens) internal {
-        // 1、权限检查
+        // 1、权限检查 - 扣押
         uint allowed = comptroller.seizeAllowed(address(this), seizerToken, liquidator, borrower, seizeTokens);
         if (allowed != 0) {
             revert LiquidateSeizeComptrollerRejection(allowed);
@@ -543,23 +499,16 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
             revert LiquidateSeizeLiquidatorIsBorrower();
         }
 
-        /*
-         * We calculate the new borrower and liquidator token balances, failing on underflow/overflow:
-         *  borrowerTokensNew = accountTokens[borrower] - seizeTokens
-         *  liquidatorTokensNew = accountTokens[liquidator] + seizeTokens
-         */
         // 计算分配：protocolSeizeTokens（协议分成：2.8%），liquidatorSeizeTokens：清算人获得
         uint protocolSeizeTokens = mul_(seizeTokens, Exp({mantissa: protocolSeizeShareMantissa}));
         uint liquidatorSeizeTokens = seizeTokens - protocolSeizeTokens;
         Exp memory exchangeRate = Exp({mantissa: exchangeRateStoredInternal()});
-        // 更新储备金
+
+        // 更新储备金数量。protocolSeizeAmount：协议清算分成的底层资产数量、 totalReservesNew：更新后的储备金数量
         uint protocolSeizeAmount = mul_ScalarTruncate(exchangeRate, protocolSeizeTokens);
         uint totalReservesNew = totalReserves + protocolSeizeAmount;
 
-
-        /////////////////////////
-        // 效果与相互作用
-        // （超出此点没有安全故障）
+        // 遵循 检查-效果-交互模式
 
         // 转移 CToken
         totalReserves = totalReservesNew;
@@ -1044,19 +993,15 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
     // 根据存储的数据返回账户的借入余额
     // 返回：错误代码，计算出的余额或如果错误代码非零则为0）
     function borrowBalanceStoredInternal(address account) internal view returns (uint) {
-        /* Get borrowBalance and borrowIndex */
+        // 获取用户的借款旧快照
         BorrowSnapshot storage borrowSnapshot = accountBorrows[account];
 
-        /* If borrowBalance = 0 then borrowIndex is likely also 0.
-         * Rather than failing the calculation with a division by 0, we immediately return 0 in this case.
-         */
+        // 如果用户从未借款，则返回0
         if (borrowSnapshot.principal == 0) {
             return 0;
         }
 
-        /* Calculate new borrow balance using the interest index:
-         *  recentBorrowBalance = borrower.borrowBalance * market.borrowIndex / borrower.borrowIndex
-         */
+        // 计算新的借款余额 = 用户借款旧快照 * （最新借贷指数 / 用户借款旧快照中的借贷指数）
         uint principalTimesIndex = borrowSnapshot.principal * borrowIndex;
         return principalTimesIndex / borrowSnapshot.interestIndex;
     }

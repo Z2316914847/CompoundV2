@@ -317,15 +317,9 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         }
     }
 
-    /**
-     * @notice Checks if the account should be allowed to borrow the underlying asset of the given market
-     * @param cToken The market to verify the borrow against
-     * @param borrower The account which would borrow the asset
-     * @param borrowAmount The amount of underlying the account would borrow
-     * @return 0 if the borrow is allowed, otherwise a semi-opaque error code (See ErrorReporter.sol)
-     */
+    // 检查账户是否允许在给定市场 借贷代币
     function borrowAllowed(address cToken, address borrower, uint borrowAmount) override external returns (uint) {
-        // Pausing is a very serious situation - we revert to sound the alarms
+        // 检查 市场级别 是否被暂停，如果是，抛出异常
         require(!borrowGuardianPaused[cToken], "borrow is paused");
 
         if (!markets[cToken].isListed) {
@@ -393,20 +387,13 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         }
     }
 
-    /**
-     * @notice Checks if the account should be allowed to repay a borrow in the given market
-     * @param cToken The market to verify the repay against
-     * @param payer The account which would repay the asset
-     * @param borrower The account which would borrowed the asset
-     * @param repayAmount The amount of the underlying asset the account would repay
-     * @return 0 if the repay is allowed, otherwise a semi-opaque error code (See ErrorReporter.sol)
-     */
+    // 检查账户是否允许在给定市场偿还代币
     function repayBorrowAllowed(
         address cToken,
         address payer,
         address borrower,
         uint repayAmount) override external returns (uint) {
-        // Shh - currently unused
+            
         payer;
         borrower;
         repayAmount;
@@ -450,38 +437,42 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
     }
 
     /**
-     * @notice Checks if the liquidation should be allowed to occur
-     * @param cTokenBorrowed Asset which was borrowed by the borrower
-     * @param cTokenCollateral Asset which was used as collateral and will be seized
-     * @param liquidator The address repaying the borrow and seizing the collateral
-     * @param borrower The address of the borrower
-     * @param repayAmount The amount of underlying being repaid
+     * @notice 检查是否允许清算发生
+     * @param cTokenBorrowed 借款人 借入资产的 市场地址
+     * @param cTokenCollateral 抵押品的市场地址
+     * @param Liquidator 清算人地址
+     * @param borrower 借款人的地址
+     * @param repayAmount 正在偿还的标的金额
      */
+    // 检查是否允许租赁
     function liquidateBorrowAllowed(
         address cTokenBorrowed,
         address cTokenCollateral,
         address liquidator,
         address borrower,
         uint repayAmount) override external returns (uint) {
-        // Shh - currently unused
-        liquidator;
 
+        liquidator;
+        // 借入与抵押市场必须 都是 已上架
         if (!markets[cTokenBorrowed].isListed || !markets[cTokenCollateral].isListed) {
             return uint(Error.MARKET_NOT_LISTED);
         }
 
-        /* The borrower must have shortfall in order to be liquidatable */
+        // 检查健康度
         (Error err, , uint shortfall) = getAccountLiquidityInternal(borrower);
         if (err != Error.NO_ERROR) {
             return uint(err);
         }
+        // 判断用户是否资金短缺情况，只有在 账户缺口 大于 0 时，才允许清算发生
         if (shortfall == 0) {
             return uint(Error.INSUFFICIENT_SHORTFALL);
         }
 
-        /* The liquidator may not repay more than what is allowed by the closeFactor */
+        // 清算人的偿还金额不得超过 closeFactor 允许的金额 
+        // 计算最大可清算额度
         uint borrowBalance = CToken(cTokenBorrowed).borrowBalanceStored(borrower);
         uint maxClose = mul_ScalarTruncate(Exp({mantissa: closeFactorMantissa}), borrowBalance);
+        // 清算金额 不能 大于 最大可清算额度
         if (repayAmount > maxClose) {
             return uint(Error.TOO_MUCH_REPAY);
         }
@@ -526,27 +517,27 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
      * @param borrower The address of the borrower
      * @param seizeTokens The number of collateral tokens to seize
      */
+    // 检查是否允许 扣押抵押品
     function seizeAllowed(
         address cTokenCollateral,
         address cTokenBorrowed,
         address liquidator,
         address borrower,
         uint seizeTokens) override external returns (uint) {
-        // Pausing is a very serious situation - we revert to sound the alarms
+        // 检查 全局扣押 是否被暂停，如果是，抛出异常 
         require(!seizeGuardianPaused, "seize is paused");
 
-        // Shh - currently unused
         seizeTokens;
 
         if (!markets[cTokenCollateral].isListed || !markets[cTokenBorrowed].isListed) {
             return uint(Error.MARKET_NOT_LISTED);
         }
-
+        // 必须存在，防止跨协议攻击
         if (CToken(cTokenCollateral).comptroller() != CToken(cTokenBorrowed).comptroller()) {
             return uint(Error.COMPTROLLER_MISMATCH);
         }
 
-        // Keep the flywheel moving
+        // COMP治理代代币 奖励分发
         updateCompSupplyIndex(cTokenCollateral);
         distributeSupplierComp(cTokenCollateral, borrower);
         distributeSupplierComp(cTokenCollateral, liquidator);
@@ -660,10 +651,10 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
     }
 
     /**
-     * @notice Determine the current account liquidity wrt collateral requirements
-     * @return (possible error code,
-                account liquidity in excess of collateral requirements,
-     *          account shortfall below collateral requirements)
+     * @notice 确定经常账户流动性与抵押品要求
+     * @return（可能的错误代码，
+                账户流动性超过抵押品要求，
+     *账户缺口低于抵押要求）
      */
     function getAccountLiquidityInternal(address account) internal view returns (Error, uint, uint) {
         return getHypotheticalAccountLiquidityInternal(account, CToken(address(0)), 0, 0);
@@ -768,40 +759,74 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         }
     }
 
-    /**
-     * @notice Calculate number of tokens of collateral asset to seize given an underlying amount
-     * @dev Used in liquidation (called in cToken.liquidateBorrowFresh)
-     * @param cTokenBorrowed The address of the borrowed cToken
-     * @param cTokenCollateral The address of the collateral cToken
-     * @param actualRepayAmount The amount of cTokenBorrowed underlying to convert into cTokenCollateral tokens
-     * @return (errorCode, number of cTokenCollateral tokens to be seized in a liquidation)
-     */
-    function liquidateCalculateSeizeTokens(address cTokenBorrowed, address cTokenCollateral, uint actualRepayAmount) override external view returns (uint, uint) {
+    // 计算 清算时 需要扣押的抵押品 cToken 数量
+    // 参数：cTokenBorrowed：借入的 cToken 地址、cTokenCollateral：抵押品 cToken 地址、actualRepayAmount：清算人实际偿还的底层资产金额（已扣减可能的余额不足部分）
+    function liquidateCalculateSeizeTokens(
+        address cTokenBorrowed,        
+        address cTokenCollateral,      
+        uint actualRepayAmount ) override external view returns (uint, uint) {
+        
+        // 步骤1：从预言机获取两个市场的底层资产价格
         /* Read oracle prices for borrowed and collateral markets */
         uint priceBorrowedMantissa = oracle.getUnderlyingPrice(CToken(cTokenBorrowed));
         uint priceCollateralMantissa = oracle.getUnderlyingPrice(CToken(cTokenCollateral));
+        
+        // 如果价格获取失败（返回0），返回错误
         if (priceBorrowedMantissa == 0 || priceCollateralMantissa == 0) {
             return (uint(Error.PRICE_ERROR), 0);
         }
 
         /*
-         * Get the exchange rate and calculate the number of collateral tokens to seize:
-         *  seizeAmount = actualRepayAmount * liquidationIncentive * priceBorrowed / priceCollateral
-         *  seizeTokens = seizeAmount / exchangeRate
-         *   = actualRepayAmount * (liquidationIncentive * priceBorrowed) / (priceCollateral * exchangeRate)
-         */
-        uint exchangeRateMantissa = CToken(cTokenCollateral).exchangeRateStored(); // Note: reverts on error
+        * 步骤2：计算扣押的底层资产金额和 cToken 数量
+        * 
+        * 计算逻辑（分两步）：
+        * 
+        * 第一步：计算需要扣押的底层资产金额（seizeAmount）
+        *   seizeAmount = actualRepayAmount × liquidationIncentive × priceBorrowed / priceCollateral
+        *   
+        *   解释：
+        *   - actualRepayAmount：清算人偿还的借款金额（底层资产单位）
+        *   - liquidationIncentive：清算奖励系数（如 1.08，表示清算人可获得 8% 的奖励）
+        *   - priceBorrowed / priceCollateral：价格比率，将借款资产转换为抵押品资产
+        *   
+        *   例如：偿还 1000 USDC，奖励 8%，USDC/ETH 价格比为 3000
+        *        seizeAmount = 1000 × 1.08 × 1 = 1080 USDC（如果抵押品也是 USDC）
+        *        或 = 1000 × 1.08 × 1/3000 = 0.36 ETH（如果抵押品是 ETH）
+        * 
+        * 第二步：将底层资产金额转换为 cToken 数量
+        *   seizeTokens = seizeAmount / exchangeRate
+        *   
+        *   解释：
+        *   - exchangeRate：cToken 与底层资产的兑换率
+        *   - 例如：如果 1 cETH = 0.02 ETH，则 0.36 ETH = 18 cETH
+        * 
+        * 合并公式（一步计算）：
+        *   seizeTokens = actualRepayAmount × (liquidationIncentive × priceBorrowed) / (priceCollateral × exchangeRate)
+        */
+        
+        // 获取抵押品市场的兑换率（cToken 与底层资产的比例）
+        uint exchangeRateMantissa = CToken(cTokenCollateral).exchangeRateStored(); // 注意：如果出错会 revert
+        
         uint seizeTokens;
-        Exp memory numerator;
-        Exp memory denominator;
-        Exp memory ratio;
-
+        Exp memory numerator;    // 分子
+        Exp memory denominator;   // 分母
+        Exp memory ratio;         // 比率
+        
+        // 计算分子：liquidationIncentive × priceBorrowed
+        // 这表示"带奖励的借款资产价值"
         numerator = mul_(Exp({mantissa: liquidationIncentiveMantissa}), Exp({mantissa: priceBorrowedMantissa}));
+        
+        // 计算分母：priceCollateral × exchangeRate
+        // 这表示"抵押品 cToken 的底层资产价值"
         denominator = mul_(Exp({mantissa: priceCollateralMantissa}), Exp({mantissa: exchangeRateMantissa}));
+        
+        // 计算比率：分子 / 分母
         ratio = div_(numerator, denominator);
-
+        
+        // 最终计算：actualRepayAmount × 比率 = 需要扣押的 cToken 数量
         seizeTokens = mul_ScalarTruncate(ratio, actualRepayAmount);
-
+        
+        // 返回成功码和扣押的 cToken 数量
         return (uint(Error.NO_ERROR), seizeTokens);
     }
 
@@ -1169,8 +1194,8 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
     }
 
     /**
-     * @notice Accrue COMP to the market by updating the borrow index
-     * @param cToken The market whose borrow index to update
+     * @notice 通过更新借入指数向市场累积 COMP
+     * @param cToken 要更新借入指数的市场
      */
     function updateCompBorrowIndex(address cToken, Exp memory marketBorrowIndex) internal {
         CompMarketState storage borrowState = compBorrowState[cToken];
@@ -1192,10 +1217,10 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
     }
 
     /**
-     * @notice Calculate COMP accrued by a borrower and possibly transfer it to them
-     * @dev Borrowers will not begin to accrue until after the first interaction with the protocol.
-     * @param cToken The market in which the borrower is interacting
-     * @param borrower The address of the borrower to distribute COMP to
+     * @notice 计算借款人累积的 COMP 并可能将其转移给他们
+     * @dev 借款人只有在与协议第一次交互后才会开始累积。
+     * @param cToken 借款人交互的市场
+     * @paramborrower 向其分发 COMP 的借款人的地址
      */
     function distributeBorrowerComp(address cToken, address borrower, Exp memory marketBorrowIndex) internal {
         CompMarketState storage borrowState = compBorrowState[cToken];

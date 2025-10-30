@@ -105,10 +105,11 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
     }
 
     /**
-     * @notice Add assets to be included in account liquidity calculation
-     * @param cTokens The list of addresses of the cToken markets to be enabled
-     * @return Success indicator for whether each corresponding market was entered
+     * @notice 添加要包含在账户流动性计算中的资产
+     * @param cTokens 要启用的 cToken 市场的地址列表
+     * @return 是否进入各个相应市场的成功指示
      */
+    // 假如市场
     function enterMarkets(address[] memory cTokens) override public returns (uint[] memory) {
         uint len = cTokens.length;
 
@@ -123,21 +124,23 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
     }
 
     /**
-     * @notice Add the market to the borrower's "assets in" for liquidity calculations
-     * @param cToken The market to enter
-     * @param borrower The address of the account to modify
-     * @return Success indicator for whether the market was entered
+     * @notice 将市场添加到借款人的“资产”中以进行流动性计算
+     * @param cToken 要进入的市场
+     * @paramborrower 要修改的账户地址
+     * @return 是否入市成功指示
      */
+    // 用户加入市场：用户资产添加到流动性计算中
     function addToMarketInternal(CToken cToken, address borrower) internal returns (Error) {
         Market storage marketToJoin = markets[address(cToken)];
 
+        // 市场是否上架
         if (!marketToJoin.isListed) {
-            // market is not listed, cannot join
+            // 市场未上市，无法加入
             return Error.MARKET_NOT_LISTED;
         }
 
+        // 用户是否已经参与此市场
         if (marketToJoin.accountMembership[borrower] == true) {
-            // already joined
             return Error.NO_ERROR;
         }
 
@@ -146,6 +149,7 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         //  this avoids having to iterate through the list for the most common use cases
         //  that is, only when we need to perform liquidity checks
         //  and not whenever we want to check if an account is in a particular market
+        // 
         marketToJoin.accountMembership[borrower] = true;
         accountAssets[borrower].push(cToken);
 
@@ -161,6 +165,7 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
      * @param cTokenAddress The address of the asset to be removed
      * @return Whether or not the account successfully exited the market
      */
+    // 推出市场
     function exitMarket(address cTokenAddress) override external returns (uint) {
         CToken cToken = CToken(cTokenAddress);
         /* Get sender tokensHeld and amountOwed underlying from the cToken */
@@ -221,6 +226,8 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         // 检查 市场级别 是否被暂停，如果是，抛出异常
         require(!mintGuardianPaused[cToken], "mint is paused");
 
+        // 在 Solidity 里，单独写一行 minter; 或 mintAmount; 是一条表达式语句，
+        //  什么也不做，但会让编译器认为参数被“读取”过，从而不报 unused variable 的警告。
         minter;
         mintAmount;
 
@@ -277,7 +284,6 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
             return uint(Error.MARKET_NOT_LISTED);
         }
 
-        /* If the redeemer is not 'in' the market, then we can bypass the liquidity check */
         // 用户（可能是 所有者/被授权者）是否使用了该市场（质押品）
         if (!markets[cToken].accountMembership[redeemer]) {
             // 没有参与这个市场，则用户可以直接赎回
@@ -326,17 +332,18 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
             return uint(Error.MARKET_NOT_LISTED);
         }
 
+        // 判断借贷人是否在市场中
         if (!markets[cToken].accountMembership[borrower]) {
-            // only cTokens may call borrowAllowed if borrower not in market
             require(msg.sender == cToken, "sender must be cToken");
 
-            // attempt to add borrower to the market
+            // 将借款人添加到市场中，之后用户的这个市场资产就会被 计入流动性计算中
             Error err = addToMarketInternal(CToken(msg.sender), borrower);
             if (err != Error.NO_ERROR) {
                 return uint(err);
             }
 
-            // it should be impossible to break the important invariant
+            // 抛出异常又三种方式：require，assert、revert
+            //   下面这段代码，按理说是一定要为真的。
             assert(markets[cToken].accountMembership[borrower]);
         }
 
@@ -576,8 +583,7 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
     // 参数：cToken：市场核实转让、src：源账户、dst：目标账户、transferTokens：转让的cToken数量
     // 如果允许转账，则为 0，否则为半透明错误代码（请参阅 ErrorReporter.sol）
     function transferAllowed(address cToken, address src, address dst, uint transferTokens) override external returns (uint) {
-        // 1、检查 全局转账 是否被暂停，如果是，抛出异常。  为什么要设置一个市场停止功能？答：设置这个功能是为了维持系统稳定，让用户有更多时间来应对市场波动，以保证用户的资金安全。
-        // 暂停是一种非常严重的情况 -我们恢复拉响警报
+        // 1、检查 全局转账 是否被暂停，如果是，抛出异常。  为什么要设置一个市场停止功能？答：设置这个功能是为了维持系统稳定，让用户有更多时间来应对市场波动。
         require(!transferGuardianPaused, "transfer is paused");
 
         // 2、目前唯一考虑的是src是否可以赎回这么多代币

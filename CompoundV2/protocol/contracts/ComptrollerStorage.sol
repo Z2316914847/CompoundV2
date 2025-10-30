@@ -29,28 +29,31 @@ contract UnitrollerAdminStorage {
 contract ComptrollerV1Storage is UnitrollerAdminStorage {
 
     /**
-     * @notice Oracle which gives the price of any given asset
+     * @notice Oracle 给出任何给定资产的价格
      */
     PriceOracle public oracle;
 
     /**
-     * @notice Multiplier used to calculate the maximum repayAmount when liquidating a borrow
+     * @notice 乘数用于计算清算借款时的最大还款金额
      */
+    // 清算质押品比例 Close Factor (0-1e18, default 0.5e18 = 0.5)
     uint public closeFactorMantissa;
 
     /**
-     * @notice Multiplier representing the discount on collateral that a liquidator receives
+     * @notice 乘数代表清算人收到的抵押品折扣
      */
     uint public liquidationIncentiveMantissa;
 
     /**
-     * @notice Max number of assets a single account can participate in (borrow or use as collateral)
+     * @notice 单个账户可参与的最大资产数量（借入或用作抵押）
      */
     uint public maxAssets;
 
     /**
-     * @notice Per-account mapping of "assets you are in", capped by maxAssets
+     * @notice “您所在资产”的每个账户映射，以 maxAssets 为上限
      */
+    // 账户地址  =>  资产列表（用户参与的市场列表：用户资产添加到流动性计算中）
+    //   用户可能有些ctoken资产没添加到市场，那么数组中变不能找到。
     mapping(address => CToken[]) public accountAssets;
 
 }
@@ -58,6 +61,7 @@ contract ComptrollerV1Storage is UnitrollerAdminStorage {
 contract ComptrollerV2Storage is ComptrollerV1Storage {
     struct Market {
         // ctoken 是否上架
+        // 这个变量在 6大功能的 权限检察中都会使用
         bool isListed;
 
         //  乘数代表在这个市场上可以以其抵押品借款的最大金额。
@@ -67,6 +71,13 @@ contract ComptrollerV2Storage is ComptrollerV1Storage {
         uint collateralFactorMantissa;
 
         // 用户是否参与此市场
+        // 这个变量在操作这个市场的ctoken是才会应用：转账、赎回、借贷。注意 清算 不算哦
+        // 用户在这个市场借贷，用户必须加入到这个市场，用户加入这个市场=》
+        //   说明用户这个市场的质押物被归入流动性计算中，如果没加入这个市场，
+        //   那么用户这个市场的资产不规流动性假设。加入这个市场的标识：
+        //   是指markets[ctoken].accountMembership[borrower] = true。
+        //   如何然他变为true呢？用户手动调用CompTroller合约的enterMakets方法（这个方法就是让用户加入到市场中）,
+        //   获取用户首次在这个市场进行借贷，借贷过程中，用户会添加到市场汇总。
         mapping(address => bool) accountMembership;
 
         // 是否参与 COMP 奖励分发
@@ -74,6 +85,7 @@ contract ComptrollerV2Storage is ComptrollerV1Storage {
     }
 
     // ctoken 地址  =>  市场信息
+    // 控制器中要保存所有市场(ctoken)
     mapping(address => Market) public markets;
 
 

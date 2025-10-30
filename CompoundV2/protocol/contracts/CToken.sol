@@ -2,10 +2,10 @@
 pragma solidity ^0.8.10;
 
 import "./ComptrollerInterface.sol";      // 控制器接口
-import "./CTokenInterfaces.sol";          // CToken 接口
-import "./ErrorReporter.sol";             // 错误报告器：token 和 Comptroller
-import "./EIP20Interface.sol";            // EIP-20 接口
 import "./InterestRateModel.sol";         // 利率模型
+import "./CTokenInterfaces.sol";          // CToken 接口
+import "./EIP20Interface.sol";            // EIP-20 接口
+import "./ErrorReporter.sol";             // 错误报告器：token 和 Comptroller
 import "./ExponentialNoError.sol";        // 指数运算库（无错误版本）
 
 abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorReporter {
@@ -66,7 +66,7 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
         // 权限检查 - 转账
         // 进行权限检查目的：
         //   1、检查市场是否被暂停，停止的话，就不让转账。
-        //   2、检查转账后，账户抵押率是否健康，健康的话，就让转账，反之，不让账户转账。💧
+        //   2、检查转账后，账户抵押率是否健康，健康的话，就让转账，反之，不让账户转账。
         // uint和int分别是uint256和int256别名. uint不能为负数,int可以为负数
         uint allowed = comptroller.transferAllowed(address(this), src, dst, tokens);
         // 使用自定义错误，节省Gas。
@@ -227,14 +227,14 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
     }
 
     // 赎回核心逻辑
-    // 参数：redeemer：赎回账户地址、redeemTokensIn：要赎回的 cToken 数量（redeemTokensIn 或 redeemAmountIn 只能有一个非零）、redeemAmountIn：要从赎回 cToken 中接收的基础资产数量（redeemTokensIn 或 redeemAmountIn 只能有一个非零）
+    // 参数：redeemer：赎回账户地址（msg.sender）、redeemTokensIn：要赎回的 cToken 数量（redeemTokensIn 或 redeemAmountIn 只能有一个非零）、redeemAmountIn：要从赎回 cToken 中接收的基础资产数量（redeemTokensIn 或 redeemAmountIn 只能有一个非零）
     function redeemFresh(address payable redeemer, uint redeemTokensIn, uint redeemAmountIn) internal {
         require(redeemTokensIn == 0 || redeemAmountIn == 0, "one of redeemTokensIn or redeemAmountIn must be zero");
 
         // 1、获取兑换率
         Exp memory exchangeRate = Exp({mantissa: exchangeRateStoredInternal() });
 
-        // 2、计算 赎回底层资产
+        // 2、计算 赎回底层资产（redeemAmount）
         uint redeemTokens;
         uint redeemAmount;
         if (redeemTokensIn > 0) {
@@ -320,6 +320,9 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
         //   计算新的用户总借款金额（含这次借贷数量）
         uint accountBorrowsNew = accountBorrowsPrev + borrowAmount;
         //   更新市场总借款金额
+        // 注意这里✔：totalBorrowsNew = totalBorrows + borrowAmount  ✔
+        // 而不是❌：totalBorrowsNew = totalBorrows + accountBorrowsNew ❌
+        // 之前我总是理解错误，理解成下面这种方式。
         uint totalBorrowsNew = totalBorrows + borrowAmount;
 
         // 遵循 检查-效果-交互模式
@@ -359,6 +362,7 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
     }
 
     // 还款核心逻辑
+    // 参数：payer 还款人地址、borrower 借款人地址、repayAmount 要偿还的金额( -1 表示全部未偿还金额)
     function repayBorrowFresh(address payer, address borrower, uint repayAmount) internal returns (uint) {
         // 权限检查
         uint allowed = comptroller.repayBorrowAllowed(address(this), payer, borrower, repayAmount);
@@ -601,7 +605,7 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
         return exchangeRateStored();
     }
 
-    // 存储的兑换率（不计息）
+    // 兑换率计算
     function exchangeRateStored() override public view returns (uint) {
         return exchangeRateStoredInternal();
     }

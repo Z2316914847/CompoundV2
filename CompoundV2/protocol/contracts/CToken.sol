@@ -362,7 +362,7 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
     }
 
     // 还款核心逻辑
-    // 参数：payer 还款人地址、borrower 借款人地址、repayAmount 要偿还的金额( -1 表示全部未偿还金额)
+    // 参数：payer 还款人地址、borrower 借款人地址、repayAmount 要偿还的金额
     function repayBorrowFresh(address payer, address borrower, uint repayAmount) internal returns (uint) {
         // 权限检查
         uint allowed = comptroller.repayBorrowAllowed(address(this), payer, borrower, repayAmount);
@@ -374,10 +374,9 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
             revert RepayBorrowFreshnessCheck();
         }
 
-        // 获取最新借款人所欠金额以及累积利息 = 还款总额 
+        // 获取 最新借款人 所欠金额以及累积利息 = 还款总额 
         uint accountBorrowsPrev = borrowBalanceStoredInternal(borrower);
 
-        // 如果 repayAmount == -1, repayAmount = accountBorrows
         uint repayAmountFinal = repayAmount == type(uint).max ? accountBorrowsPrev : repayAmount;
 
         // 遵循 检查-效果-交互模式
@@ -413,6 +412,7 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
         accrueInterest();
 
         // 为什么这里又执行一次更新 累计利息
+        //   因为上面的 accrueInterest() 是更新 当前市场 的累计利息，而下面的是更新被 清算市场的 累计利息。
         uint error = cTokenCollateral.accrueInterest();
         if (error != NO_ERROR) {
             revert LiquidateAccrueCollateralInterestFailed(error);
@@ -450,19 +450,21 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
             revert LiquidateCloseAmountIsUintMax();
         }
 
-        // 2、得到实际偿还额
+        // 2、清算人体 借贷人还款，得到实际 偿还金额。然后根据 实际 偿还金额 计算出 清算获得的奖励
         uint actualRepayAmount = repayBorrowFresh(liquidator, borrower, repayAmount);
 
-        /////////////////////////
-        // 效果与相互作用
-        // （超出此点没有安全故障）
+        // 遵循 检查-效果-交互模式
 
-        // 3、计算清算获得
-        //   计算将被扣押的 抵押 ctoken代币 数量
+        // 3、计算 要扣押 的质押品
+        // 为什么计算 要扣押 的质押品数量要去comptroller中计算？答：因为预言机是由comptroller统一控制，
+        //   第二点是因为 CToken 合约只管理单个市场，无法访问其他市场的数据。第三点是因为清算时协议级别参数
+        // amountSeizeError：返回成功码、seizeTokens：扣押的 cToken 数量
         (uint amountSeizeError, uint seizeTokens) = comptroller.liquidateCalculateSeizeTokens(address(this), address(cTokenCollateral), actualRepayAmount);
         require(amountSeizeError == NO_ERROR, "LIQUIDATE_COMPTROLLER_CALCULATE_AMOUNT_SEIZE_FAILED");
 
         // 如果借款人抵押代币余额 < acquireTokens 则恢复 
+        //   为什么要这个判断？答：有一种场景需要这个判断：
+        //     1、当 偿还金额 > 用户质押总价值 时
         require(cTokenCollateral.balanceOf(borrower) >= seizeTokens, "LIQUIDATE_SEIZE_TOO_MUCH");
 
         // 4、执行扣押
@@ -509,6 +511,7 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
         Exp memory exchangeRate = Exp({mantissa: exchangeRateStoredInternal()});
 
         // 更新储备金数量。protocolSeizeAmount：协议清算分成的底层资产数量、 totalReservesNew：更新后的储备金数量
+        //   底层资产 = 兑换率 * ctoken数量
         uint protocolSeizeAmount = mul_ScalarTruncate(exchangeRate, protocolSeizeTokens);
         uint totalReservesNew = totalReserves + protocolSeizeAmount;
 
@@ -644,7 +647,7 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
         return borrowBalanceStored(account);
     }
 
-    // 存储的借款余额。不触发计息，基于存储数据计算
+    // 存储的借款余额。不触发计息（假如调用这个方法之前执行了accrueInterest(),那么就会计息，反之，不会计息）
     function borrowBalanceStored(address account) override public view returns (uint) {
         return borrowBalanceStoredInternal(account);
     }
@@ -994,8 +997,7 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
         return totalBorrows;
     }
 
-    // 根据存储的数据返回账户的借入余额
-    // 返回：错误代码，计算出的余额或如果错误代码非零则为0）
+    // 获取用户借贷总额度
     function borrowBalanceStoredInternal(address account) internal view returns (uint) {
         // 获取用户的借款旧快照
         BorrowSnapshot storage borrowSnapshot = accountBorrows[account];

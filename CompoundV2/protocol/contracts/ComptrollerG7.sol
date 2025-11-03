@@ -1,18 +1,16 @@
 // SPDX-License-Identifier: BSD-3-Clause
 pragma solidity ^0.8.10;
 
-import "./CToken.sol";
-import "./ErrorReporter.sol";
-import "./PriceOracle.sol";
-import "./ComptrollerInterface.sol";
-import "./ComptrollerStorage.sol";
-import "./Unitroller.sol";
-import "./Governance/Comp.sol";
+import "./CToken.sol";                    // 市场
+import "./ErrorReporter.sol";             // 错误报告器：token 和 Comptroller
+import "./PriceOracle.sol";               // 预言机
+import "./ComptrollerInterface.sol";      // 控制器接口
+import "./ComptrollerStorage.sol";        // 控制器存储
+import "./Unitroller.sol";                // 单位角色
+import "./Governance/Comp.sol";           // 治理合约
 
-/**
- * @title Compound's Comptroller Contract
- * @author Compound
- */
+// ComptrollerG7为什么不继承ComptrollerV7Storage？因为ComptrollerG7使用的是同一个 compSpeeds[cToken] 既用于供应奖励，
+//   也用于借贷奖励。如果继承 V6，会需要两个独立的速度变量（compSupplySpeeds 和 compBorrowSpeeds），这与当前设计不符。
 contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, ComptrollerErrorReporter, ExponentialNoError {
     /// @notice Emitted when an admin supports a market
     event MarketListed(CToken cToken);
@@ -94,22 +92,16 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         return assetsIn;
     }
 
-    /**
-     * @notice Returns whether the given account is entered in the given asset
-     * @param account The address of the account to check
-     * @param cToken The cToken to check
-     * @return True if the account is in the asset, otherwise false.
-     */
+    // 检查用户 是否将 资产加入到 流动性计算
     function checkMembership(address account, CToken cToken) external view returns (bool) {
         return markets[address(cToken)].accountMembership[account];
     }
 
-    /**
-     * @notice 添加要包含在账户流动性计算中的资产
-     * @param cTokens 要启用的 cToken 市场的地址列表
-     * @return 是否进入各个相应市场的成功指示
-     */
-    // 假如市场
+    // =============================================================================================
+    //                                 用户 加入/退出市场
+    // =============================================================================================
+
+    // 用户加入一个市场 或 多个市场。请不要把 用户加入市场 和 市场加入到comtroller混淆 
     function enterMarkets(address[] memory cTokens) override public returns (uint[] memory) {
         uint len = cTokens.length;
 
@@ -123,12 +115,6 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         return results;
     }
 
-    /**
-     * @notice 将市场添加到借款人的“资产”中以进行流动性计算
-     * @param cToken 要进入的市场
-     * @paramborrower 要修改的账户地址
-     * @return 是否入市成功指示
-     */
     // 用户加入市场：用户资产添加到流动性计算中
     function addToMarketInternal(CToken cToken, address borrower) internal returns (Error) {
         Market storage marketToJoin = markets[address(cToken)];
@@ -158,14 +144,7 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         return Error.NO_ERROR;
     }
 
-    /**
-     * @notice Removes asset from sender's account liquidity calculation
-     * @dev Sender must not have an outstanding borrow balance in the asset,
-     *  or be providing necessary collateral for an outstanding borrow.
-     * @param cTokenAddress The address of the asset to be removed
-     * @return Whether or not the account successfully exited the market
-     */
-    // 推出市场
+    // 退出市场（用户退出资产流动性计算）
     function exitMarket(address cTokenAddress) override external returns (uint) {
         CToken cToken = CToken(cTokenAddress);
         /* Get sender tokensHeld and amountOwed underlying from the cToken */
@@ -218,7 +197,34 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         return uint(Error.NO_ERROR);
     }
 
-    /*** Policy Hooks ***/
+    // =============================================================================================
+    //                                 策略钩子函数(在ctoken中被调用)
+    // =============================================================================================
+
+    // 检查是否允许账户在给定市场转移代币
+    // 参数：cToken：市场核实转让、src：源账户、dst：目标账户、transferTokens：转让的cToken数量
+    // 如果允许转账，则为 0，否则为半透明错误代码（请参阅 ErrorReporter.sol）
+    function transferAllowed(address cToken, address src, address dst, uint transferTokens) override external returns (uint) {
+        // 1、检查 全局转账 是否被暂停，如果是，抛出异常。  为什么要设置一个市场停止功能？答：设置这个功能是为了维持系统稳定，让用户有更多时间来应对市场波动。
+        require(!transferGuardianPaused, "transfer is paused");
+
+        // 2、目前唯一考虑的是src是否可以赎回这么多代币
+        uint allowed = redeemAllowedInternal(cToken, src, transferTokens);
+        if (allowed != uint(Error.NO_ERROR)) {
+            return allowed;
+        }
+
+        // 3、COMP 奖励分发：每次转账都会触发奖励分发
+
+        // 更新该市场的 COMP 供应指数
+        updateCompSupplyIndex(cToken);
+        // 为发送方分发 COMP 奖励
+        distributeSupplierComp(cToken, src);
+        // 为接收方分发 COMP 奖励
+        distributeSupplierComp(cToken, dst);
+
+        return uint(Error.NO_ERROR);
+    }
 
     // 检查是否应允许帐户在给定市场中铸造代币
     // 返回：如果允许铸造，则为返回 0，否则为半不透明错误代码（请参阅 ErrorReporter.sol）
@@ -241,26 +247,6 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         distributeSupplierComp(cToken, minter);
 
         return uint(Error.NO_ERROR);
-    }
-
-    /**
-     * @notice Validates mint and reverts on rejection. May emit logs.
-     * @param cToken Asset being minted
-     * @param minter The address minting the tokens
-     * @param actualMintAmount The amount of the underlying asset being minted
-     * @param mintTokens The number of tokens being minted
-     */
-    function mintVerify(address cToken, address minter, uint actualMintAmount, uint mintTokens) override external {
-        // Shh - currently unused
-        cToken;
-        minter;
-        actualMintAmount;
-        mintTokens;
-
-        // Shh - we don't ever want this hook to be marked pure
-        if (false) {
-            maxAssets = maxAssets;
-        }
     }
 
     // 检查账户是否允许在给定市场赎回代币
@@ -303,24 +289,6 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         }
 
         return uint(Error.NO_ERROR);
-    }
-
-    /**
-     * @notice Validates redeem and reverts on rejection. May emit logs.
-     * @param cToken Asset being redeemed
-     * @param redeemer The address redeeming the tokens
-     * @param redeemAmount The amount of the underlying asset being redeemed
-     * @param redeemTokens The number of tokens being redeemed
-     */
-    function redeemVerify(address cToken, address redeemer, uint redeemAmount, uint redeemTokens) override external {
-        // Shh - currently unused
-        cToken;
-        redeemer;
-
-        // Require tokens is zero or amount is also zero
-        if (redeemTokens == 0 && redeemAmount > 0) {
-            revert("redeemTokens zero");
-        }
     }
 
     // 检查账户是否允许在给定市场 借贷代币
@@ -376,24 +344,6 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         return uint(Error.NO_ERROR);
     }
 
-    /**
-     * @notice Validates borrow and reverts on rejection. May emit logs.
-     * @param cToken Asset whose underlying is being borrowed
-     * @param borrower The address borrowing the underlying
-     * @param borrowAmount The amount of the underlying asset requested to borrow
-     */
-    function borrowVerify(address cToken, address borrower, uint borrowAmount) override external {
-        // Shh - currently unused
-        cToken;
-        borrower;
-        borrowAmount;
-
-        // Shh - we don't ever want this hook to be marked pure
-        if (false) {
-            maxAssets = maxAssets;
-        }
-    }
-
     // 检查账户是否允许在给定市场偿还代币
     function repayBorrowAllowed(
         address cToken,
@@ -415,32 +365,6 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         distributeBorrowerComp(cToken, borrower, borrowIndex);
 
         return uint(Error.NO_ERROR);
-    }
-
-    /**
-     * @notice Validates repayBorrow and reverts on rejection. May emit logs.
-     * @param cToken Asset being repaid
-     * @param payer The address repaying the borrow
-     * @param borrower The address of the borrower
-     * @param actualRepayAmount The amount of underlying being repaid
-     */
-    function repayBorrowVerify(
-        address cToken,
-        address payer,
-        address borrower,
-        uint actualRepayAmount,
-        uint borrowerIndex) override external {
-        // Shh - currently unused
-        cToken;
-        payer;
-        borrower;
-        actualRepayAmount;
-        borrowerIndex;
-
-        // Shh - we don't ever want this hook to be marked pure
-        if (false) {
-            maxAssets = maxAssets;
-        }
     }
 
     // 检查是否允许清算用户
@@ -479,35 +403,6 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         return uint(Error.NO_ERROR);
     }
 
-    /**
-     * @notice Validates liquidateBorrow and reverts on rejection. May emit logs.
-     * @param cTokenBorrowed Asset which was borrowed by the borrower
-     * @param cTokenCollateral Asset which was used as collateral and will be seized
-     * @param liquidator The address repaying the borrow and seizing the collateral
-     * @param borrower The address of the borrower
-     * @param actualRepayAmount The amount of underlying being repaid
-     */
-    function liquidateBorrowVerify(
-        address cTokenBorrowed,
-        address cTokenCollateral,
-        address liquidator,
-        address borrower,
-        uint actualRepayAmount,
-        uint seizeTokens) override external {
-        // Shh - currently unused
-        cTokenBorrowed;
-        cTokenCollateral;
-        liquidator;
-        borrower;
-        actualRepayAmount;
-        seizeTokens;
-
-        // Shh - we don't ever want this hook to be marked pure
-        if (false) {
-            maxAssets = maxAssets;
-        }
-    }
-
     // 检查是否允许扣押抵押品
     function seizeAllowed(
         address cTokenCollateral,   // 用作抵押品并将被扣押的资产
@@ -536,19 +431,104 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         return uint(Error.NO_ERROR);
     }
 
-    /**
-     * @notice Validates seize and reverts on rejection. May emit logs.
-     * @param cTokenCollateral Asset which was used as collateral and will be seized
-     * @param cTokenBorrowed Asset which was borrowed by the borrower
-     * @param liquidator The address repaying the borrow and seizing the collateral
-     * @param borrower The address of the borrower
-     * @param seizeTokens The number of collateral tokens to seize
-     */
+    // 参数：ctoken：市场、src：发送代币地址、dst：接受代币地址、TransferTokens：要转移的 cToken 数量
+    function transferVerify(address cToken, address src, address dst, uint transferTokens) override external {
+        // 嘘——目前未使用
+        cToken;
+        src;
+        dst;
+        transferTokens;
+
+        // 嘘 -我们不希望这个钩子被标记为纯的
+        if (false) {
+            maxAssets = maxAssets;
+        }
+    }
+
+    // 参数：ctoken：市场、minter：接受代币地址、actualMintAmount：铸造底层资产数量、mintTokens：铸造ctoken代币数量
+    function mintVerify(address cToken, address minter, uint actualMintAmount, uint mintTokens) override external {
+        // 嘘——目前未使用
+        cToken;
+        minter;
+        actualMintAmount;
+        mintTokens;
+
+        // 嘘 -我们不希望这个钩子被标记为纯的
+        if (false) {
+            maxAssets = maxAssets;
+        }
+    }
+
+    // 参数：ctoken：市场、minter：接受代币地址、actualMintAmount：赎回底层资产数量、mintTokens：赎回ctoken代币数量
+    function redeemVerify(address cToken, address redeemer, uint redeemAmount, uint redeemTokens) override external {
+        // Shh - currently unused
+        cToken;
+        redeemer;
+
+        // Require tokens is zero or amount is also zero
+        if (redeemTokens == 0 && redeemAmount > 0) {
+            revert("redeemTokens zero");
+        }
+    }
+
+    // 参数：ctoken：市场、minter：接受代币地址、actualMintAmount：借入底层资产数量、mintTokens：借入ctoken代币数量
+    function borrowVerify(address cToken, address borrower, uint borrowAmount) override external {
+        // Shh - currently unused
+        cToken;
+        borrower;
+        borrowAmount;
+
+        // Shh - we don't ever want this hook to be marked pure
+        if (false) {
+            maxAssets = maxAssets;
+        }
+    }
+
+    function repayBorrowVerify(
+        address cToken,           // 市场
+        address payer,            // 偿还地址
+        address borrower,         // 借贷地址
+        uint actualRepayAmount,   // 偿还底层资产数量
+        uint borrowerIndex) override external {
+        // Shh - currently unused
+        cToken;
+        payer;
+        borrower;
+        actualRepayAmount;
+        borrowerIndex;
+
+        // Shh - we don't ever want this hook to be marked pure
+        if (false) {
+            maxAssets = maxAssets;
+        }
+    }
+
+    function liquidateBorrowVerify(
+        address cTokenBorrowed,      // 借贷人借贷资产地址
+        address cTokenCollateral,    // 借贷人质押品地址
+        address liquidator,          // 清算人地址
+        address borrower,            // 借贷人地址
+        uint actualRepayAmount,      // 偿还底层资产数量
+        uint seizeTokens) override external {
+        // Shh - currently unused
+        cTokenBorrowed;
+        cTokenCollateral;
+        liquidator;
+        borrower;
+        actualRepayAmount;
+        seizeTokens;
+
+        // Shh - we don't ever want this hook to be marked pure
+        if (false) {
+            maxAssets = maxAssets;
+        }
+    }
+
     function seizeVerify(
-        address cTokenCollateral,
-        address cTokenBorrowed,
-        address liquidator,
-        address borrower,
+        address cTokenCollateral,    // 用作抵押品并将被扣押的资产
+        address cTokenBorrowed,      // 借贷人借贷资产地址
+        address liquidator,          // 清算人地址
+        address borrower,            // 借贷人地址、 扣押ctoken数量
         uint seizeTokens) override external {
         // Shh - currently unused
         cTokenCollateral;
@@ -563,103 +543,38 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         }
     }
 
-    // 检查是否允许账户在给定市场转移代币
-    // 参数：cToken：市场核实转让、src：源账户、dst：目标账户、transferTokens：转让的cToken数量
-    // 如果允许转账，则为 0，否则为半透明错误代码（请参阅 ErrorReporter.sol）
-    function transferAllowed(address cToken, address src, address dst, uint transferTokens) override external returns (uint) {
-        // 1、检查 全局转账 是否被暂停，如果是，抛出异常。  为什么要设置一个市场停止功能？答：设置这个功能是为了维持系统稳定，让用户有更多时间来应对市场波动。
-        require(!transferGuardianPaused, "transfer is paused");
+    // =============================================================================================
+    //                                  流动性计算
+    // =============================================================================================
 
-        // 2、目前唯一考虑的是src是否可以赎回这么多代币
-        uint allowed = redeemAllowedInternal(cToken, src, transferTokens);
-        if (allowed != uint(Error.NO_ERROR)) {
-            return allowed;
-        }
-
-        // 3、COMP 奖励分发：每次转账都会触发奖励分发
-
-        // 更新该市场的 COMP 供应指数
-        updateCompSupplyIndex(cToken);
-        // 为发送方分发 COMP 奖励
-        distributeSupplierComp(cToken, src);
-        // 为接收方分发 COMP 奖励
-        distributeSupplierComp(cToken, dst);
-
-        return uint(Error.NO_ERROR);
-    }
-
-    /**
-     * @notice Validates transfer and reverts on rejection. May emit logs.
-     * @param cToken Asset being transferred
-     * @param src The account which sources the tokens
-     * @param dst The account which receives the tokens
-     * @param transferTokens The number of cTokens to transfer
-     */
-    function transferVerify(address cToken, address src, address dst, uint transferTokens) override external {
-        // Shh - currently unused
-        cToken;
-        src;
-        dst;
-        transferTokens;
-
-        // Shh - we don't ever want this hook to be marked pure
-        if (false) {
-            maxAssets = maxAssets;
-        }
-    }
-
-    /*** Liquidity/Liquidation Calculations ***/
-
-    /**
-     * @dev Local vars for avoiding stack-depth limits in calculating account liquidity.
-     *  Note that `cTokenBalance` is the number of cTokens the account owns in the market,
-     *  whereas `borrowBalance` is the amount of underlying that the account has borrowed.
-     */
+    // 账户流动性本地标签：用于避免计算帐户流动性时的堆栈深度限制
     struct AccountLiquidityLocalVars {
         uint sumCollateral;            // 总质押品价值
         uint sumBorrowPlusEffects;     // 总借贷价值（含假设操作）
-        uint cTokenBalance;            // ctoken 余额
-        uint borrowBalance;            // 借贷余额
+        uint cTokenBalance;            // ctoken 数量
+        uint borrowBalance;            // 借贷 数量
         uint exchangeRateMantissa;     // 兑换率
         uint oraclePriceMantissa;      // 预言机价格
         Exp collateralFactor;          // 抵押因子
         Exp exchangeRate;
         Exp oraclePrice;
-        Exp tokensToDenom;
+        Exp tokensToDenom;             
     }
 
-    /**
-     * @notice Determine the current account liquidity wrt collateral requirements
-     * @return (possible error code (semi-opaque),
-                account liquidity in excess of collateral requirements,
-     *          account shortfall below collateral requirements)
-     */
+    // 获取账户的流动性状态
+    // 返回(状态码、流动性余额、流动性资产短缺)
     function getAccountLiquidity(address account) public view returns (uint, uint, uint) {
         (Error err, uint liquidity, uint shortfall) = getHypotheticalAccountLiquidityInternal(account, CToken(address(0)), 0, 0);
 
         return (uint(err), liquidity, shortfall);
     }
 
-    /**
-     * @notice 确定经常账户流动性与抵押品要求
-     * @return（可能的错误代码，
-                账户流动性超过抵押品要求，
-     *账户缺口低于抵押要求）
-     */
+    // 内部函数
     function getAccountLiquidityInternal(address account) internal view returns (Error, uint, uint) {
         return getHypotheticalAccountLiquidityInternal(account, CToken(address(0)), 0, 0);
     }
 
-    /**
-     * @notice Determine what the account liquidity would be if the given amounts were redeemed/borrowed
-     * @param cTokenModify The market to hypothetically redeem/borrow in
-     * @param account The account to determine liquidity for
-     * @param redeemTokens The number of tokens to hypothetically redeem
-     * @param borrowAmount The amount of underlying to hypothetically borrow
-     * @return (possible error code (semi-opaque),
-                hypothetical account liquidity in excess of collateral requirements,
-     *          hypothetical account shortfall below collateral requirements)
-     */
+    // 假设执行某些操作后的流动性状态
     function getHypotheticalAccountLiquidity(
         address account,
         address cTokenModify,
@@ -669,64 +584,59 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         return (uint(err), liquidity, shortfall);
     }
 
-    /**
-     * @notice Determine what the account liquidity would be if the given amounts were redeemed/borrowed
-     * @param cTokenModify The market to hypothetically redeem/borrow in
-     * @param account The account to determine liquidity for
-     * @param redeemTokens The number of tokens to hypothetically redeem
-     * @param borrowAmount The amount of underlying to hypothetically borrow
-     * @dev Note that we calculate the exchangeRateStored for each collateral cToken using stored data,
-     *  without calculating accumulated interest.
-     * @return (possible error code,
-                hypothetical account liquidity in excess of collateral requirements,
-     *          hypothetical account shortfall below collateral requirements)
-     */
-    // 内部函数：流动性检查
-    // 参数：account：要确定流动性的账户（可能是账户 所有者/被  授权者）、cTokenModify：要假设赎回/借入的市场、redeemTokens：要假设赎回的代币数量、borrowAmount：要假设借入的基础金额
-    // 返回：可能的错误代码、流动性余额（为正数）、流动性不足余额（为负数）
+    // 内部函数：健康度检查
+    // 首先的得明白：比较的是价格，所以必须要将他们化为统一单位
+    // 用户质押底层资产 * 代币资产的价格 * 最大抵押率 > 用户借贷底层资产 * 代币资产价格
     function getHypotheticalAccountLiquidityInternal(
-        address account,
-        CToken cTokenModify,
-        uint redeemTokens,
-        uint borrowAmount) internal view returns (Error, uint, uint) {
+        address account,         // 被检查健康度的 账户
+        CToken cTokenModify,     // 要赎回/借入的市场
+        uint redeemTokens,       // 赎回 ctoken的数量
+        uint borrowAmount        // 借贷 Ctoken的数量
+        ) internal view returns (Error, uint, uint) {
 
         // 保存所有的计算结果
         AccountLiquidityLocalVars memory vars; 
         uint oErr;
-
-        // 遍历用户（所有者/被授权者）的所有资产
         CToken[] memory assets = accountAssets[account];
+
+        // 遍历用户的所有资产（这个资产是用户主动进入的），这样就能获取到 用户在每个市场的 抵押数量和借贷数量，进而计算出用户在这个市场 质押价值和借贷价值。
+        //   在然后就是累计所有市场的 抵押价值和借贷价值。
         for (uint i = 0; i < assets.length; i++) {
+            // 获取市场
             CToken asset = assets[i];
 
-            // 获取资产快照（用户ctoken余额、用户借贷余额、当前兑换率）
+            // 获取：状态码、用户在这个市场 ctoken数量、用户在这个市场 借贷数量、当前兑换率）
             (oErr, vars.cTokenBalance, vars.borrowBalance, vars.exchangeRateMantissa) = asset.getAccountSnapshot(account);
-            if (oErr != 0) { // semi-opaque error code, we assume NO_ERROR == 0 is invariant between upgrades
+            
+            // 判断状态码是否匹配
+            if (oErr != 0) {
                 return (Error.SNAPSHOT_ERROR, 0, 0);
             }
-            // 计算抵押品价值
+
+            // 获取 这个市场的抵押因子 和 这个市场的兑换率
             vars.collateralFactor = Exp({mantissa: markets[address(asset)].collateralFactorMantissa});
             vars.exchangeRate = Exp({mantissa: vars.exchangeRateMantissa});
 
-            // Get the normalized price of the asset
+            // 获取代币的真实价格：用预言机获取
             vars.oraclePriceMantissa = oracle.getUnderlyingPrice(asset);
             if (vars.oraclePriceMantissa == 0) {
                 return (Error.PRICE_ERROR, 0, 0);
             }
             vars.oraclePrice = Exp({mantissa: vars.oraclePriceMantissa});
 
-            // Pre-compute a conversion factor from tokens -> ether (normalized price value)
+            // 预先计算代币 -> 以太币（标准化价格值）的转换系数
             vars.tokensToDenom = mul_(mul_(vars.collateralFactor, vars.exchangeRate), vars.oraclePrice);
 
-            // sumCollateral += tokensToDenom * cTokenBalance
+            // 汇总 抵押价值: sumCollateral += tokensToDenom * cTokenBalance
+            //  用户在这个市场拥有的 CToken * ( collateralFactor * exchangeRate * oraclePrice) 
+            //   = CToken * exchangeRate * ( collateralFactor * oraclePrice)
+            //   = 用户在这个市场的 底层资产数量 * 抵押率 * 每个底层资产价格 = 最多可以借贷数量 
             vars.sumCollateral = mul_ScalarTruncateAddUInt(vars.tokensToDenom, vars.cTokenBalance, vars.sumCollateral);
 
-            // sumBorrowPlusEffects += oraclePrice * borrowBalance
-            // 计算借贷价值
+            // 汇总 借贷价值: sumBorrowPlusEffects += oraclePrice * borrowBalance
             vars.sumBorrowPlusEffects = mul_ScalarTruncateAddUInt(vars.oraclePrice, vars.borrowBalance, vars.sumBorrowPlusEffects);
 
-            // Calculate effects of interacting with cTokenModify
-            // 处理假设操作的影响
+            // 判断 要赎回/借入的市场 是否等于 用户资产中的某一项市场
             if (asset == cTokenModify) {
                 // redeem effect
                 // sumBorrowPlusEffects += tokensToDenom * redeemTokens
@@ -740,11 +650,12 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
             }
         }
 
-        // 计算最终结果
-        // 这些是安全的，因为首先检查下溢条件
+        // 判断 借贷价值 是否大于 最大质押率价值  
         if (vars.sumCollateral > vars.sumBorrowPlusEffects) {
+            // 借贷价值 < 最大质押率价值   说明账户健康
             return (Error.NO_ERROR, vars.sumCollateral - vars.sumBorrowPlusEffects, 0);
         } else {
+            // // 借贷价值 >= 最大质押率价值   说明账户 不健康
             return (Error.NO_ERROR, 0, vars.sumBorrowPlusEffects - vars.sumCollateral);
         }
     }
@@ -821,13 +732,11 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         return (uint(Error.NO_ERROR), seizeTokens);
     }
 
-    /*** Admin Functions ***/
+    // =============================================================================================
+    //                                  管理员功能
+    // =============================================================================================
 
-    /**
-      * @notice Sets a new price oracle for the comptroller
-      * @dev Admin function to set a new price oracle
-      * @return uint 0=success, otherwise a failure (see ErrorReporter.sol for details)
-      */
+    // 管理功能设置新的价格预言机
     function _setPriceOracle(PriceOracle newOracle) public returns (uint) {
         // Check caller is admin
         if (msg.sender != admin) {
@@ -846,12 +755,7 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         return uint(Error.NO_ERROR);
     }
 
-    /**
-      * @notice Sets the closeFactor used when liquidating borrows
-      * @dev Admin function to set closeFactor
-      * @param newCloseFactorMantissa New close factor, scaled by 1e18
-      * @return uint 0=success, otherwise a failure
-      */
+    // 设置清算比例：一般清算用户借贷资产的50%
     function _setCloseFactor(uint newCloseFactorMantissa) external returns (uint) {
         // Check caller is admin
     	require(msg.sender == admin, "only admin can set close factor");
@@ -863,13 +767,7 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         return uint(Error.NO_ERROR);
     }
 
-    /**
-      * @notice Sets the collateralFactor for a market
-      * @dev Admin function to set per-market collateralFactor
-      * @param cToken The market to set the factor on
-      * @param newCollateralFactorMantissa The new collateral factor, scaled by 1e18
-      * @return uint 0=success, otherwise a failure. (See ErrorReporter for details)
-      */
+    // 设置某个市场的质押率：eth最多可以借贷60%、Btc最多借贷70%....
     function _setCollateralFactor(CToken cToken, uint newCollateralFactorMantissa) external returns (uint) {
         // Check caller is admin
         if (msg.sender != admin) {
@@ -905,12 +803,7 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         return uint(Error.NO_ERROR);
     }
 
-    /**
-      * @notice Sets liquidationIncentive
-      * @dev Admin function to set liquidationIncentive
-      * @param newLiquidationIncentiveMantissa New liquidationIncentive scaled by 1e18
-      * @return uint 0=success, otherwise a failure. (See ErrorReporter for details)
-      */
+    // 设置清算奖励：一般清算奖励是5%-8%
     function _setLiquidationIncentive(uint newLiquidationIncentiveMantissa) external returns (uint) {
         // Check caller is admin
         if (msg.sender != admin) {
@@ -929,12 +822,7 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         return uint(Error.NO_ERROR);
     }
 
-    /**
-      * @notice Add the market to the markets mapping and set it as listed
-      * @dev Admin function to set isListed and add support for the market
-      * @param cToken The address of the market (token) to list
-      * @return uint 0=success, otherwise a failure. (See enum Error for details)
-      */
+    // 将市场上架
     function _supportMarket(CToken cToken) external returns (uint) {
         if (msg.sender != admin) {
             return fail(Error.UNAUTHORIZED, FailureInfo.SUPPORT_MARKET_OWNER_CHECK);
@@ -944,21 +832,22 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
             return fail(Error.MARKET_ALREADY_LISTED, FailureInfo.SUPPORT_MARKET_EXISTS);
         }
 
-        cToken.isCToken(); // Sanity check to make sure its really a CToken
+        // 健全性检查以确保其确实是 CToken。其实 isctoken不是方法，而是一个 变量
+        cToken.isCToken();
 
-        // Note that isComped is not in active use anymore
+        // 请注意 isComped 不再有效使用
         Market storage market = markets[address(cToken)];
         market.isListed = true;
         market.isComped = false;
         market.collateralFactorMantissa = 0;
-
+        // 将市场添加到流动性计算中
         _addMarketInternal(address(cToken));
 
         emit MarketListed(cToken);
 
         return uint(Error.NO_ERROR);
     }
-
+    // 将市场添加到流动性计算中
     function _addMarketInternal(address cToken) internal {
         for (uint i = 0; i < allMarkets.length; i ++) {
             require(allMarkets[i] != CToken(cToken), "market already added");
@@ -966,13 +855,7 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         allMarkets.push(CToken(cToken));
     }
 
-
-    /**
-      * @notice Set the given borrow caps for the given cToken markets. Borrowing that brings total borrows to or above borrow cap will revert.
-      * @dev Admin or borrowCapGuardian function to set the borrow caps. A borrow cap of 0 corresponds to unlimited borrowing.
-      * @param cTokens The addresses of the markets (tokens) to change the borrow caps for
-      * @param newBorrowCaps The new borrow cap values in underlying to be set. A value of 0 corresponds to unlimited borrowing.
-      */
+    // 设置给定 cToken 市场的给定借入上限
     function _setMarketBorrowCaps(CToken[] calldata cTokens, uint[] calldata newBorrowCaps) external {
     	require(msg.sender == admin || msg.sender == borrowCapGuardian, "only admin or borrow cap guardian can set borrow caps");
 
@@ -987,10 +870,7 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         }
     }
 
-    /**
-     * @notice Admin function to change the Borrow Cap Guardian
-     * @param newBorrowCapGuardian The address of the new Borrow Cap Guardian
-     */
+    // 设置借用上限监护人的管理功能
     function _setBorrowCapGuardian(address newBorrowCapGuardian) external {
         require(msg.sender == admin, "only admin can set borrow cap guardian");
 
@@ -1004,11 +884,7 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         emit NewBorrowCapGuardian(oldBorrowCapGuardian, newBorrowCapGuardian);
     }
 
-    /**
-     * @notice Admin function to change the Pause Guardian
-     * @param newPauseGuardian The address of the new Pause Guardian
-     * @return uint 0=success, otherwise a failure. (See enum Error for details)
-     */
+    // 管理功能更改暂停监护人
     function _setPauseGuardian(address newPauseGuardian) public returns (uint) {
         if (msg.sender != admin) {
             return fail(Error.UNAUTHORIZED, FailureInfo.SET_PAUSE_GUARDIAN_OWNER_CHECK);
@@ -1026,6 +902,7 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         return uint(Error.NO_ERROR);
     }
 
+    // 设置铸造暂停
     function _setMintPaused(CToken cToken, bool state) public returns (bool) {
         require(markets[address(cToken)].isListed, "cannot pause a market that is not listed");
         require(msg.sender == pauseGuardian || msg.sender == admin, "only pause guardian and admin can pause");
@@ -1036,6 +913,7 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         return state;
     }
 
+    // 设置借贷暂停
     function _setBorrowPaused(CToken cToken, bool state) public returns (bool) {
         require(markets[address(cToken)].isListed, "cannot pause a market that is not listed");
         require(msg.sender == pauseGuardian || msg.sender == admin, "only pause guardian and admin can pause");
@@ -1046,6 +924,7 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         return state;
     }
 
+    // 设置转账暂停 
     function _setTransferPaused(bool state) public returns (bool) {
         require(msg.sender == pauseGuardian || msg.sender == admin, "only pause guardian and admin can pause");
         require(msg.sender == admin || state == true, "only admin can unpause");
@@ -1055,6 +934,7 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         return state;
     }
 
+    // 设置清算暂停
     function _setSeizePaused(bool state) public returns (bool) {
         require(msg.sender == pauseGuardian || msg.sender == admin, "only pause guardian and admin can pause");
         require(msg.sender == admin || state == true, "only admin can unpause");
@@ -1069,20 +949,16 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         require(unitroller._acceptImplementation() == 0, "change not authorized");
     }
 
-    /**
-     * @notice Checks caller is admin, or this contract is becoming the new implementation
-     */
+    // 检查调用者是否为管理员，或者此合约正在成为新的实现
     function adminOrInitializing() internal view returns (bool) {
         return msg.sender == admin || msg.sender == comptrollerImplementation;
     }
 
-    /*** Comp Distribution ***/
+    // =============================================================================================
+    //                                  Comp 分配
+    // =============================================================================================
 
-    /**
-     * @notice Set COMP speed for a single market
-     * @param cToken The market whose COMP speed to update
-     * @param compSpeed New COMP speed for market
-     */
+    // 设置市场的 compSeed
     function setCompSpeedInternal(CToken cToken, uint compSpeed) internal {
         uint currentCompSpeed = compSpeeds[address(cToken)];
         if (currentCompSpeed != 0) {
@@ -1116,29 +992,33 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         }
     }
 
-    /**
-     * @notice 通过更新供应指数向市场累积COMP
-     * @param cToken The market whose supply index to update
-     */
     // 更新该市场的 COMP 供应指数
+    // 需要的数据：区块号，comp速率、
     function updateCompSupplyIndex(address cToken) internal {
-        // 获取该市场的状态（上次更新时的指数和区块号）
+        // 获取该市场的状态: 上次更新时的 指数和区块号
         CompMarketState storage supplyState = compSupplyState[cToken];
+
         // 获取该市场的 COMP 发放速度（每秒发放多少 COMP）
         uint supplySpeed = compSpeeds[cToken];
+
         // 计算经过了几个区块
         uint blockNumber = getBlockNumber();
         uint deltaBlocks = sub_(blockNumber, uint(supplyState.block));
+        
         // 如果有新区块且有发放速度，
         if (deltaBlocks > 0 && supplySpeed > 0) {
             // 1.获取当前的总供应量
             uint supplyTokens = CToken(cToken).totalSupply();
+
             // 2.计算应该发放的总 COMP 数量,  奖励 = 经过的区块数 × 每秒发放量
             uint compAccrued = mul_(deltaBlocks, supplySpeed);
+
             // 3.计算每个 cToken 应该新增多少 COMP 比率,  比率 = 总应发放的 COMP / 总供应量
             Double memory ratio = supplyTokens > 0 ? fraction(compAccrued, supplyTokens) : Double({mantissa: 0});
+
             // 4.更新全局指数 = 旧指数 + 新增比率
             Double memory index = add_(Double({mantissa: supplyState.index}), ratio);
+            
             // 5.保存新状态
             compSupplyState[cToken] = CompMarketState({
                 index: safe224(index.mantissa, "new index exceeds 224 bits"),
@@ -1150,20 +1030,18 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         }
     }
 
-     /**
-     * @notice 计算供应商累积的 COMP 并可能将其转移给他们
-     * @param cToken The market in which the supplier is interacting
-     * @param supplier The address of the supplier to distribute COMP to
-     */
-    // 为发送方分发 COMP 奖励
+    // 为分发 COMP 奖励  -  supply
     // 用户应得 COMP = 用户持有 cToken × (当前指数 - 用户上次快照指数)
     function distributeSupplierComp(address cToken, address supplier) internal {
         // 获取市场的供应状态
         CompMarketState storage supplyState = compSupplyState[cToken];
+        
         // 获取全局供应指数。将 uint 类型的指数转换为 Double 类型（用于定点数运算）
         Double memory supplyIndex = Double({mantissa: supplyState.index});
+        
         // 获取用户的旧快照
         Double memory supplierIndex = Double({mantissa: compSupplierIndex[cToken][supplier]});
+        
         // 更新用户的快照到最新。下次再调用此函数时，supplierIndex 就是最新的了，不会重复计算奖励
         compSupplierIndex[cToken][supplier] = supplyIndex.mantissa;
 
@@ -1174,20 +1052,21 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
 
         // 计算指数差异：计算从用户上次快照到现在，指数增长了多少
         Double memory deltaIndex = sub_(supplyIndex, supplierIndex);
+        
         // 获取用户持有的代币数量
         uint supplierTokens = CToken(cToken).balanceOf(supplier);
+        
         // 计算用户应得的 COMP：用户应得的 COMP = 持有的代币数量 × 指数增长
         uint supplierDelta = mul_(supplierTokens, deltaIndex);
+        
         // 累加到总债权：将这次新增的 COMP 累加到用户的总债权中
         uint supplierAccrued = add_(compAccrued[supplier], supplierDelta);
         compAccrued[supplier] = supplierAccrued;
+        
         emit DistributedSupplierComp(CToken(cToken), supplier, supplierDelta, supplyIndex.mantissa);
     }
 
-    /**
-     * @notice 通过更新借入指数向市场累积 COMP
-     * @param cToken 要更新借入指数的市场
-     */
+    // 通过更新借入指数向市场累积 COMP
     function updateCompBorrowIndex(address cToken, Exp memory marketBorrowIndex) internal {
         CompMarketState storage borrowState = compBorrowState[cToken];
         uint borrowSpeed = compSpeeds[cToken];
@@ -1207,12 +1086,7 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         }
     }
 
-    /**
-     * @notice 计算借款人累积的 COMP 并可能将其转移给他们
-     * @dev 借款人只有在与协议第一次交互后才会开始累积。
-     * @param cToken 借款人交互的市场
-     * @paramborrower 向其分发 COMP 的借款人的地址
-     */
+    // 为分发 COMP 奖励  -  borrow
     function distributeBorrowerComp(address cToken, address borrower, Exp memory marketBorrowIndex) internal {
         CompMarketState storage borrowState = compBorrowState[cToken];
         Double memory borrowIndex = Double({mantissa: borrowState.index});
@@ -1230,8 +1104,8 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
     }
 
     /**
-     * @notice Calculate additional accrued COMP for a contributor since last accrual
-     * @param contributor The address to calculate contributor rewards for
+     * @notice 计算自上次应计以来贡献者的额外应计 COMP
+     * @param贡献者计算贡献者奖励的地址
      */
     function updateContributorRewards(address contributor) public {
         uint compSpeed = compContributorSpeeds[contributor];
@@ -1246,19 +1120,13 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         }
     }
 
-    /**
-     * @notice Claim all the comp accrued by holder in all markets
-     * @param holder The address to claim COMP for
-     */
+    // 领取用户在所有市场的所有 COMP 奖励
     function claimComp(address holder) public {
         return claimComp(holder, allMarkets);
     }
 
-    /**
-     * @notice Claim all the comp accrued by holder in the specified markets
-     * @param holder The address to claim COMP for
-     * @param cTokens The list of markets to claim COMP in
-     */
+    // 内部函数：领取指定市场中持有者累积的所有补偿
+    // 参数：holder：接受地址、ctokens：领取 COMP 的市场列表
     function claimComp(address holder, CToken[] memory cTokens) public {
         address[] memory holders = new address[](1);
         holders[0] = holder;
@@ -1266,11 +1134,11 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
     }
 
     /**
-     * @notice Claim all comp accrued by the holders
-     * @param holders The addresses to claim COMP for
-     * @param cTokens The list of markets to claim COMP in
-     * @param borrowers Whether or not to claim COMP earned by borrowing
-     * @param suppliers Whether or not to claim COMP earned by supplying
+     * @notice 索取持有人累积的所有补偿
+     * @param持有者领取COMP的地址
+     * @param cTokens 领取 COMP 的市场列表
+     * @paramborrowers 是否领取借入所得的COMP
+     * @param供应商是否要求通过供应获得的COMP
      */
     function claimComp(address[] memory holders, CToken[] memory cTokens, bool borrowers, bool suppliers) public {
         for (uint i = 0; i < cTokens.length; i++) {
@@ -1294,13 +1162,7 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         }
     }
 
-    /**
-     * @notice Transfer COMP to the user
-     * @dev Note: If there is not enough COMP, we do not perform the transfer all.
-     * @param user The address of the user to transfer COMP to
-     * @param amount The amount of COMP to (possibly) transfer
-     * @return The amount of COMP which was NOT transferred to the user
-     */
+    // 转移COMP代币
     function grantCompInternal(address user, uint amount) internal returns (uint) {
         Comp comp = Comp(getCompAddress());
         uint compRemaining = comp.balanceOf(address(this));
@@ -1311,14 +1173,17 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         return amount;
     }
 
-    /*** Comp Distribution Admin ***/
+    // =============================================================================================
+    //                                  Comp 奖励管理
+    // =============================================================================================
 
     /**
-     * @notice Transfer COMP to the recipient
-     * @dev Note: If there is not enough COMP, we do not perform the transfer all.
-     * @param recipient The address of the recipient to transfer COMP to
-     * @param amount The amount of COMP to (possibly) transfer
+     * @notice 将 COMP 转移给接收者
+     * @dev 注意：如果没有足够的 COMP，我们不会执行全部传输。
+     * @paramrecipient要将COMP传输到的接收者的地址
+     * @param amount 要（可能）转移的 COMP 数量
      */
+    // 直接授予COMP（管理员功能）
     function _grantComp(address recipient, uint amount) public {
         require(adminOrInitializing(), "only admin can grant comp");
         uint amountLeft = grantCompInternal(recipient, amount);
@@ -1327,20 +1192,22 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
     }
 
     /**
-     * @notice Set COMP speed for a single market
-     * @param cToken The market whose COMP speed to update
-     * @param compSpeed New COMP speed for market
+     * @notice 设置单一市场的 COMP 速度
+     * @param cToken COMP更新速度的市场
+     * @param compSpeed 面向市场的新 COMP 速度
      */
+    // 设置市场的 COMP 发放速度
     function _setCompSpeed(CToken cToken, uint compSpeed) public {
         require(adminOrInitializing(), "only admin can set comp speed");
         setCompSpeedInternal(cToken, compSpeed);
     }
 
     /**
-     * @notice Set COMP speed for a single contributor
-     * @param contributor The contributor whose COMP speed to update
-     * @param compSpeed New COMP speed for contributor
+     * @notice 为单个贡献者设置 COMP 速度
+     * @param贡献者COMP更新速度的贡献者
+     * @param compSpeed 贡献者的新 COMP 速度
      */
+    // 设置贡献者的 COMP 发放速度
     function _setContributorCompSpeed(address contributor, uint compSpeed) public {
         require(adminOrInitializing(), "only admin can set comp speed");
 
@@ -1358,9 +1225,9 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
     }
 
     /**
-     * @notice Return all of the markets
-     * @dev The automatic getter may be used to access an individual market.
-     * @return The list of market addresses
+     * @notice 返回所有市场
+     * @dev 自动获取器可用于访问单个市场。
+     * @return 市场地址列表
      */
     function getAllMarkets() public view returns (CToken[] memory) {
         return allMarkets;
@@ -1370,10 +1237,7 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         return block.number;
     }
 
-    /**
-     * @notice Return the address of the COMP token
-     * @return The address of COMP
-     */
+    // COMP代币地址
     function getCompAddress() public view returns (address) {
         return 0xc00e94Cb662C3520282E6f5717214004A7f26888;
     }

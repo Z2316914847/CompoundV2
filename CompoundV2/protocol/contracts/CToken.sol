@@ -3,7 +3,7 @@ pragma solidity ^0.8.10;
 
 import "./ComptrollerInterface.sol";      // 控制器接口
 import "./InterestRateModel.sol";         // 利率模型
-import "./CTokenInterfaces.sol";          // CToken 接口
+import "./CTokenInterfaces.sol";          // CToken 接口，也包含储存槽
 import "./EIP20Interface.sol";            // EIP-20 接口
 import "./ErrorReporter.sol";             // 错误报告器：token 和 Comptroller
 import "./ExponentialNoError.sol";        // 指数运算库（无错误版本）
@@ -652,9 +652,8 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
         return borrowBalanceStoredInternal(account);
     }
 
-    // 账户快照：获取账户余额的快照以及缓存的汇率
-    // 用途：控制器用于高效的流动性检查
-    // 返回：（错误代码（0表达成功）、ctoken代币余额、借款余额、兑换率）
+    // 获取用户旧照
+    // 返回：状态码、ctoken代币余额、借款余额、兑换率）
     function getAccountSnapshot(address account) override external view returns (uint, uint, uint, uint) {
         return (
             NO_ERROR,

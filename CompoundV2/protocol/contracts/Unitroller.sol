@@ -3,11 +3,7 @@ pragma solidity ^0.8.10;
 
 import "./ErrorReporter.sol";
 import "./ComptrollerStorage.sol";
-/**
- * @title ComptrollerCore
- * @dev Storage for the comptroller is at this address, while execution is delegated to the `comptrollerImplementation`.
- * CTokens should reference this contract as their comptroller.
- */
+
 //  他们说这个是：comptroller的代理合约，用于升级comptroller合约
 contract Unitroller is UnitrollerAdminStorage, ComptrollerErrorReporter {
 
@@ -36,7 +32,7 @@ contract Unitroller is UnitrollerAdminStorage, ComptrollerErrorReporter {
         admin = msg.sender;
     }
 
-    /*** Admin Functions ***/
+    // 升级Comptroller - implementation - Pending
     function _setPendingImplementation(address newPendingImplementation) public returns (uint) {
 
         if (msg.sender != admin) {
@@ -52,18 +48,14 @@ contract Unitroller is UnitrollerAdminStorage, ComptrollerErrorReporter {
         return uint(Error.NO_ERROR);
     }
 
-    /**
-    * @notice Accepts new implementation of comptroller. msg.sender must be pendingImplementation
-    * @dev Admin function for new implementation to accept it's role as implementation
-    * @return uint 0=success, otherwise a failure (see ErrorReporter.sol for details)
-    */
+    // 将 pending 转为 正式：这个方法必须由Comptroller调用
     function _acceptImplementation() public returns (uint) {
-        // Check caller is pendingImplementation and pendingImplementation ≠ address(0)
+        // 检查调用者是否为pendingImplementation 且 pendingImplementation ≠ 地址(0)
         if (msg.sender != pendingComptrollerImplementation || pendingComptrollerImplementation == address(0)) {
             return fail(Error.UNAUTHORIZED, FailureInfo.ACCEPT_PENDING_IMPLEMENTATION_ADDRESS_CHECK);
         }
 
-        // Save current values for inclusion in log
+        // 保存当前值以包含在日志中
         address oldImplementation = comptrollerImplementation;
         address oldPendingImplementation = pendingComptrollerImplementation;
 

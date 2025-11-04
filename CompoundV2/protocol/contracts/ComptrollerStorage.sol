@@ -15,7 +15,7 @@ contract UnitrollerAdminStorage {
     //  Unitroller 活跃的大脑
     address public comptrollerImplementation;
 
-    //  Unitroller 待定的大脑
+    //  Comptroller地址 - implementation - Pending
     address public pendingComptrollerImplementation;
 }
 
@@ -39,8 +39,7 @@ contract ComptrollerV1Storage is UnitrollerAdminStorage {
      */
     uint public maxAssets;
 
-    // 账户地址  =>  资产列表（用户参与的市场列表：用户资产添加到流动性计算中）
-    //   用户可能有些ctoken资产没添加到市场，那么数组中变不能找到。
+    // 用户加入的市场(这里的市场：只算流动性计算部分，用户可能有些ctoken资产没添加到市场，那么数组中变不能找到。)
     mapping(address => CToken[]) public accountAssets;
 
 }
@@ -130,7 +129,7 @@ contract ComptrollerV4Storage is ComptrollerV3Storage {
     mapping(address => uint) public borrowCaps;
 }
 
-// V5 - 设置贡献者 将可以从每个区块获得 COMP治理代币
+// V5 - 设置贡献者 将可以从每个区块获得 COMP治理代币。distribute是分配、Contributor时贡献者
 contract ComptrollerV5Storage is ComptrollerV4Storage {
     // 每个贡献者在每个区块中收到的 COMP 部分
     mapping(address => uint) public compContributorSpeeds;

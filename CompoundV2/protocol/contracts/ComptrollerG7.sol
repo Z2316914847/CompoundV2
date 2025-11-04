@@ -12,80 +12,83 @@ import "./Governance/Comp.sol";           // 治理合约
 // ComptrollerG7为什么不继承ComptrollerV7Storage？因为ComptrollerG7使用的是同一个 compSpeeds[cToken] 既用于供应奖励，
 //   也用于借贷奖励。如果继承 V6，会需要两个独立的速度变量（compSupplySpeeds 和 compBorrowSpeeds），这与当前设计不符。
 contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, ComptrollerErrorReporter, ExponentialNoError {
-    /// @notice Emitted when an admin supports a market
+    // 市场上架时发出     
     event MarketListed(CToken cToken);
 
-    /// @notice Emitted when an account enters a market
+    /// 账户进入市场时发出
     event MarketEntered(CToken cToken, address account);
 
-    /// @notice Emitted when an account exits a market
+    // 账户退出市场时发出
     event MarketExited(CToken cToken, address account);
 
-    /// @notice Emitted when close factor is changed by admin
+    // 更改清算比例时发出
     event NewCloseFactor(uint oldCloseFactorMantissa, uint newCloseFactorMantissa);
 
-    /// @notice Emitted when a collateral factor is changed by admin
+    // 更改抵押因子时发出
     event NewCollateralFactor(CToken cToken, uint oldCollateralFactorMantissa, uint newCollateralFactorMantissa);
 
-    /// @notice Emitted when liquidation incentive is changed by admin
+    // 更改清算奖励时发出
     event NewLiquidationIncentive(uint oldLiquidationIncentiveMantissa, uint newLiquidationIncentiveMantissa);
 
-    /// @notice Emitted when price oracle is changed
+    // 更改预言机时发出
     event NewPriceOracle(PriceOracle oldPriceOracle, PriceOracle newPriceOracle);
 
-    /// @notice Emitted when pause guardian is changed
+    // 当暂停守护者更改时发出
     event NewPauseGuardian(address oldPauseGuardian, address newPauseGuardian);
 
-    /// @notice Emitted when an action is paused globally
+    // 当操作全局暂停时发出
     event ActionPaused(string action, bool pauseState);
 
-    /// @notice Emitted when an action is paused on a market
+    // 当市场上的操作暂停时发出
     event ActionPaused(CToken cToken, string action, bool pauseState);
 
-    /// @notice Emitted when a new COMP speed is calculated for a market
+    // 当为市场计算新的 COMP 速度时发出
     event CompSpeedUpdated(CToken indexed cToken, uint newSpeed);
 
-    /// @notice Emitted when a new COMP speed is set for a contributor
+    // 当为贡献者设置新的 COMP 速度时发出
     event ContributorCompSpeedUpdated(address indexed contributor, uint newSpeed);
 
-    /// @notice Emitted when COMP is distributed to a supplier
+    // 当 COMP 分发给供应商时发出
     event DistributedSupplierComp(CToken indexed cToken, address indexed supplier, uint compDelta, uint compSupplyIndex);
 
-    /// @notice Emitted when COMP is distributed to a borrower
+    // 当 COMP 分发给借款人时发出
     event DistributedBorrowerComp(CToken indexed cToken, address indexed borrower, uint compDelta, uint compBorrowIndex);
 
-    /// @notice Emitted when borrow cap for a cToken is changed
+    // 当 cToken 的借入上限更改时发出
     event NewBorrowCap(CToken indexed cToken, uint newBorrowCap);
 
-    /// @notice Emitted when borrow cap guardian is changed
+    // 当借用上限监护人更改时发出
     event NewBorrowCapGuardian(address oldBorrowCapGuardian, address newBorrowCapGuardian);
 
-    /// @notice Emitted when COMP is granted by admin
+    // 当管理员授予 COMP 时发出
     event CompGranted(address recipient, uint amount);
 
-    /// @notice The initial COMP index for a market
+    // 市场的初始 COMP 指数，1*e18 = compSupplyState[address].index 
     uint224 public constant compInitialIndex = 1e36;
 
-    // closeFactorMantissa must be strictly greater than this value
+    // closeFactorMantissa 必须严格大于该值
     uint internal constant closeFactorMinMantissa = 0.05e18; // 0.05
 
-    // closeFactorMantissa must not exceed this value
+    // closeFactorMantissa 不得超过该值
     uint internal constant closeFactorMaxMantissa = 0.9e18; // 0.9
 
-    // No collateralFactorMantissa may exceed this value
+    // 抵押因子尾数不得超过该值
     uint internal constant collateralFactorMaxMantissa = 0.9e18; // 0.9
 
     constructor() public {
         admin = msg.sender;
     }
 
-    /*** Assets You Are In ***/
+    // =============================================================================================
+    //                                 
+    // ============================================================================================= 
 
     /**
-     * @notice Returns the assets an account has entered
-     * @param account The address of the account to pull assets for
-     * @return A dynamic list with the assets the account has entered
+     * @notice 返回账户已输入的资产
+     * @param account 拉取资产的账户地址
+     * @return 包含账户已输入资产的动态列表
      */
+    // 获取用户资产 - 这些资产是 归入流动性计算部分
     function getAssetsIn(address account) external view returns (CToken[] memory) {
         CToken[] memory assetsIn = accountAssets[account];
 
@@ -102,6 +105,8 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
     // =============================================================================================
 
     // 用户加入一个市场 或 多个市场。请不要把 用户加入市场 和 市场加入到comtroller混淆 
+    //   market[ctoken].accountMembership[borrow] = true (市场级别记录加入市场)
+    //   accountAssets[user_Address].push[ctoken]  （获取用户加入所有的市场（注意是流动性部分））
     function enterMarkets(address[] memory cTokens) override public returns (uint[] memory) {
         uint len = cTokens.length;
 
@@ -130,12 +135,7 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
             return Error.NO_ERROR;
         }
 
-        // survived the gauntlet, add to list
-        // NOTE: we store these somewhat redundantly as a significant optimization
-        //  this avoids having to iterate through the list for the most common use cases
-        //  that is, only when we need to perform liquidity checks
-        //  and not whenever we want to check if an account is in a particular market
-        // 
+        // 用户加入市场
         marketToJoin.accountMembership[borrower] = true;
         accountAssets[borrower].push(cToken);
 
@@ -146,17 +146,19 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
 
     // 退出市场（用户退出资产流动性计算）
     function exitMarket(address cTokenAddress) override external returns (uint) {
+        // 获取退出的市场
         CToken cToken = CToken(cTokenAddress);
-        /* Get sender tokensHeld and amountOwed underlying from the cToken */
-        (uint oErr, uint tokensHeld, uint amountOwed, ) = cToken.getAccountSnapshot(msg.sender);
-        require(oErr == 0, "exitMarket: getAccountSnapshot failed"); // semi-opaque error code
 
-        /* Fail if the sender has a borrow balance */
+        // 获取用户在这个市场的（没更新）：状态码（获取数据是否成功）、ctoken代币余额、借款余额、兑换率）
+        (uint oErr, uint tokensHeld, uint amountOwed, ) = cToken.getAccountSnapshot(msg.sender);
+        require(oErr == 0, "exitMarket: getAccountSnapshot failed");
+
+        // 退出市场时，用户在这个市场必须没有借贷。因为退出市场后，accountAssets[address]会减去这个市场。accountAssets这个变量不仅可以获取资产还可以获取借贷余额
         if (amountOwed != 0) {
             return fail(Error.NONZERO_BORROW_BALANCE, FailureInfo.EXIT_MARKET_BALANCE_OWED);
         }
 
-        /* Fail if the sender is not permitted to redeem all of their tokens */
+        // 假设用户退出市场后，健康度检查
         uint allowed = redeemAllowedInternal(cTokenAddress, msg.sender, tokensHeld);
         if (allowed != 0) {
             return failOpaque(Error.REJECTION, FailureInfo.EXIT_MARKET_REJECTION, allowed);
@@ -164,16 +166,16 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
 
         Market storage marketToExit = markets[address(cToken)];
 
-        /* Return true if the sender is not already ‘in’ the market */
+        // 如果发送者尚未“进入”市场，则统一退出市场
         if (!marketToExit.accountMembership[msg.sender]) {
             return uint(Error.NO_ERROR);
         }
 
-        /* Set cToken account membership to false */
+        // 删除用户在市场级别的记录
         delete marketToExit.accountMembership[msg.sender];
 
-        /* Delete cToken from the account’s list of assets */
-        // load into memory for faster iteration
+        /*从账户资产列表中删除cToken */
+        // 加载到内存中以加快迭代速度
         CToken[] memory userAssetList = accountAssets[msg.sender];
         uint len = userAssetList.length;
         uint assetIndex = len;
@@ -184,13 +186,17 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
             }
         }
 
-        // We *must* have found the asset in the list or our redundant data structure is broken
+        // 我们*必须*已在列表中找到该资产，否则我们的冗余数据结构已损坏
         assert(assetIndex < len);
 
-        // copy last item in list to location of item to be removed, reduce length by 1
+        // 将列表中的最后一项复制到要删除的项的位置，长度减少 1
+        // 在 exitMarket 中，直接删除中间元素会移动大量元素，成本高。当前做法是：
+        //   将最后一个元素移到目标位置
+        //   用 pop() 删除最后一个元素
+        //   这样只需一次赋值和一次 pop()，Gas 成本更低，适合数组操作。
         CToken[] storage storedList = accountAssets[msg.sender];
         storedList[assetIndex] = storedList[storedList.length - 1];
-        storedList.pop();
+        storedList.pop();  // 删除最后一项数据，仅适用于动态数组（storage 数组）
 
         emit MarketExited(cToken, msg.sender);
 
@@ -757,7 +763,6 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
 
     // 设置清算比例：一般清算用户借贷资产的50%
     function _setCloseFactor(uint newCloseFactorMantissa) external returns (uint) {
-        // Check caller is admin
     	require(msg.sender == admin, "only admin can set close factor");
 
         uint oldCloseFactorMantissa = closeFactorMantissa;
@@ -769,12 +774,10 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
 
     // 设置某个市场的质押率：eth最多可以借贷60%、Btc最多借贷70%....
     function _setCollateralFactor(CToken cToken, uint newCollateralFactorMantissa) external returns (uint) {
-        // Check caller is admin
         if (msg.sender != admin) {
             return fail(Error.UNAUTHORIZED, FailureInfo.SET_COLLATERAL_FACTOR_OWNER_CHECK);
         }
 
-        // Verify market is listed
         Market storage market = markets[address(cToken)];
         if (!market.isListed) {
             return fail(Error.MARKET_NOT_LISTED, FailureInfo.SET_COLLATERAL_FACTOR_NO_EXISTS);
@@ -782,22 +785,20 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
 
         Exp memory newCollateralFactorExp = Exp({mantissa: newCollateralFactorMantissa});
 
-        // Check collateral factor <= 0.9
+        // 抵押率必须 <= 0.9
         Exp memory highLimit = Exp({mantissa: collateralFactorMaxMantissa});
         if (lessThanExp(highLimit, newCollateralFactorExp)) {
             return fail(Error.INVALID_COLLATERAL_FACTOR, FailureInfo.SET_COLLATERAL_FACTOR_VALIDATION);
         }
 
-        // If collateral factor != 0, fail if price == 0
+        // 抵押率 != 0, 底层资产价格 == 0
         if (newCollateralFactorMantissa != 0 && oracle.getUnderlyingPrice(cToken) == 0) {
             return fail(Error.PRICE_ERROR, FailureInfo.SET_COLLATERAL_FACTOR_WITHOUT_PRICE);
         }
 
-        // Set market's collateral factor to new collateral factor, remember old value
         uint oldCollateralFactorMantissa = market.collateralFactorMantissa;
         market.collateralFactorMantissa = newCollateralFactorMantissa;
 
-        // Emit event with asset, old collateral factor, and new collateral factor
         emit NewCollateralFactor(cToken, oldCollateralFactorMantissa, newCollateralFactorMantissa);
 
         return uint(Error.NO_ERROR);
@@ -805,18 +806,14 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
 
     // 设置清算奖励：一般清算奖励是5%-8%
     function _setLiquidationIncentive(uint newLiquidationIncentiveMantissa) external returns (uint) {
-        // Check caller is admin
         if (msg.sender != admin) {
             return fail(Error.UNAUTHORIZED, FailureInfo.SET_LIQUIDATION_INCENTIVE_OWNER_CHECK);
         }
 
-        // Save current value for use in log
         uint oldLiquidationIncentiveMantissa = liquidationIncentiveMantissa;
 
-        // Set liquidation incentive to new incentive
         liquidationIncentiveMantissa = newLiquidationIncentiveMantissa;
 
-        // Emit event with old incentive, new incentive
         emit NewLiquidationIncentive(oldLiquidationIncentiveMantissa, newLiquidationIncentiveMantissa);
 
         return uint(Error.NO_ERROR);
@@ -847,6 +844,7 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
 
         return uint(Error.NO_ERROR);
     }
+
     // 将市场添加到流动性计算中
     function _addMarketInternal(address cToken) internal {
         for (uint i = 0; i < allMarkets.length; i ++) {
@@ -874,13 +872,10 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
     function _setBorrowCapGuardian(address newBorrowCapGuardian) external {
         require(msg.sender == admin, "only admin can set borrow cap guardian");
 
-        // Save current value for inclusion in log
         address oldBorrowCapGuardian = borrowCapGuardian;
 
-        // Store borrowCapGuardian with value newBorrowCapGuardian
         borrowCapGuardian = newBorrowCapGuardian;
 
-        // Emit NewBorrowCapGuardian(OldBorrowCapGuardian, NewBorrowCapGuardian)
         emit NewBorrowCapGuardian(oldBorrowCapGuardian, newBorrowCapGuardian);
     }
 
@@ -890,17 +885,41 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
             return fail(Error.UNAUTHORIZED, FailureInfo.SET_PAUSE_GUARDIAN_OWNER_CHECK);
         }
 
-        // Save current value for inclusion in log
         address oldPauseGuardian = pauseGuardian;
 
-        // Store pauseGuardian with value newPauseGuardian
         pauseGuardian = newPauseGuardian;
 
-        // Emit NewPauseGuardian(OldPauseGuardian, NewPauseGuardian)
         emit NewPauseGuardian(oldPauseGuardian, pauseGuardian);
 
         return uint(Error.NO_ERROR);
     }
+
+    // _become 是 Compound 协议中用于升级 Comptroller 实现合约的方法，属于代理升级模式（Proxy Upgrade Pattern）。
+    //   Unitroller（代理合约）：存储状态，地址固定、用户交互的入口Comptroller（实现合约）：逻辑实现，可升级
+    // 1. 部署新版本的 ComptrollerG7 实现合约
+    //    ↓
+    // 2. 管理员调用 Unitroller._setPendingImplementation(新合约地址)
+    //    ↓
+    // 3. 新合约调用 _become(Unitroller地址)
+    //    ↓
+    // 4. _become 内部调用 Unitroller._acceptImplementation()
+    //    ↓
+    // 5. Unitroller 的 comptrollerImplementation 更新为新地址
+    //    ↓
+    // 6. 所有后续调用通过 fallback 函数委托到新实现
+    function _become(Unitroller unitroller) public {
+        require(msg.sender == unitroller.admin(), "only unitroller admin can change brains");
+        require(unitroller._acceptImplementation() == 0, "change not authorized");
+    }
+
+    // 检查调用者是否为管理员，或者此合约正在成为新的实现
+    function adminOrInitializing() internal view returns (bool) {
+        return msg.sender == admin || msg.sender == comptrollerImplementation;
+    }
+
+    // =============================================================================================
+    //                                 暂停/启动市场
+    // =============================================================================================
 
     // 设置铸造暂停
     function _setMintPaused(CToken cToken, bool state) public returns (bool) {
@@ -944,33 +963,51 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         return state;
     }
 
-    function _become(Unitroller unitroller) public {
-        require(msg.sender == unitroller.admin(), "only unitroller admin can change brains");
-        require(unitroller._acceptImplementation() == 0, "change not authorized");
-    }
-
-    // 检查调用者是否为管理员，或者此合约正在成为新的实现
-    function adminOrInitializing() internal view returns (bool) {
-        return msg.sender == admin || msg.sender == comptrollerImplementation;
-    }
-
     // =============================================================================================
     //                                  Comp 分配
     // =============================================================================================
 
-    // 设置市场的 compSeed
+    // 设置市场的 COMP 发放速度
+    function _setCompSpeed(CToken cToken, uint compSpeed) public {
+        require(adminOrInitializing(), "only admin can set comp speed");
+        setCompSpeedInternal(cToken, compSpeed);
+    }
+
+    // 设置贡献者的 COMP 发放速度
+    function _setContributorCompSpeed(address contributor, uint compSpeed) public {
+        require(adminOrInitializing(), "only admin can set comp speed");
+
+        // 请注意，COMP 速度可以设置为 0，以停止对贡献者的流动性奖励
+        updateContributorRewards(contributor);
+        if (compSpeed == 0) {
+            // 释放存储
+            delete lastContributorBlock[contributor];
+        } else {
+            lastContributorBlock[contributor] = getBlockNumber();
+        }
+        compContributorSpeeds[contributor] = compSpeed;
+
+        emit ContributorCompSpeedUpdated(contributor, compSpeed);
+    }
+
+    // 内部函数：设置市场的 compSeed
     function setCompSpeedInternal(CToken cToken, uint compSpeed) internal {
+        // 获取这个市场的 compSeed
         uint currentCompSpeed = compSpeeds[address(cToken)];
+        
         if (currentCompSpeed != 0) {
-            // note that COMP speed could be set to 0 to halt liquidity rewards for a market
+            // 进入到这里有只有一种情况：旧市场compSeed != 0。请注意，COMP 速度可以设置为 0 以停止市场的流动性奖励
+            // 更新compSeed 之前先将之前的supplyIndex/borrowIndex更新完：因为supplyIndex/borrowIndex会涉及COMP奖励发放。所以更新compSeed 之前先将之前的supplyIndex/borrowIndex更新号。
             Exp memory borrowIndex = Exp({mantissa: cToken.borrowIndex()});
             updateCompSupplyIndex(address(cToken));
             updateCompBorrowIndex(address(cToken), borrowIndex);
         } else if (compSpeed != 0) {
-            // Add the COMP market
+            // 进入到这里有这2种情况：第一次设置市场的compSeed，或者后续市场的compSeed 从 0 -> 非0
+            // 一般是：市场的compSeed 从 0 -> 非0
             Market storage market = markets[address(cToken)];
             require(market.isListed == true, "comp market is not listed");
 
+            // 市场的全局供应指数 = 0 && 市场的区块 = 0
             if (compSupplyState[address(cToken)].index == 0 && compSupplyState[address(cToken)].block == 0) {
                 compSupplyState[address(cToken)] = CompMarketState({
                     index: compInitialIndex,
@@ -978,6 +1015,7 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
                 });
             }
 
+            // 市场的全局借贷指数 = 0 && 市场的区块 = 0
             if (compBorrowState[address(cToken)].index == 0 && compBorrowState[address(cToken)].block == 0) {
                 compBorrowState[address(cToken)] = CompMarketState({
                     index: compInitialIndex,
@@ -1030,6 +1068,26 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         }
     }
 
+    // 更新该市场的 COMP 借贷指数
+    function updateCompBorrowIndex(address cToken, Exp memory marketBorrowIndex) internal {
+        CompMarketState storage borrowState = compBorrowState[cToken];
+        uint borrowSpeed = compSpeeds[cToken];
+        uint blockNumber = getBlockNumber();
+        uint deltaBlocks = sub_(blockNumber, uint(borrowState.block));
+        if (deltaBlocks > 0 && borrowSpeed > 0) {
+            uint borrowAmount = div_(CToken(cToken).totalBorrows(), marketBorrowIndex);
+            uint compAccrued = mul_(deltaBlocks, borrowSpeed);
+            Double memory ratio = borrowAmount > 0 ? fraction(compAccrued, borrowAmount) : Double({mantissa: 0});
+            Double memory index = add_(Double({mantissa: borrowState.index}), ratio);
+            compBorrowState[cToken] = CompMarketState({
+                index: safe224(index.mantissa, "new index exceeds 224 bits"),
+                block: safe32(blockNumber, "block number exceeds 32 bits")
+            });
+        } else if (deltaBlocks > 0) {
+            borrowState.block = safe32(blockNumber, "block number exceeds 32 bits");
+        }
+    }
+
     // 为分发 COMP 奖励  -  supply
     // 用户应得 COMP = 用户持有 cToken × (当前指数 - 用户上次快照指数)
     function distributeSupplierComp(address cToken, address supplier) internal {
@@ -1066,26 +1124,6 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         emit DistributedSupplierComp(CToken(cToken), supplier, supplierDelta, supplyIndex.mantissa);
     }
 
-    // 通过更新借入指数向市场累积 COMP
-    function updateCompBorrowIndex(address cToken, Exp memory marketBorrowIndex) internal {
-        CompMarketState storage borrowState = compBorrowState[cToken];
-        uint borrowSpeed = compSpeeds[cToken];
-        uint blockNumber = getBlockNumber();
-        uint deltaBlocks = sub_(blockNumber, uint(borrowState.block));
-        if (deltaBlocks > 0 && borrowSpeed > 0) {
-            uint borrowAmount = div_(CToken(cToken).totalBorrows(), marketBorrowIndex);
-            uint compAccrued = mul_(deltaBlocks, borrowSpeed);
-            Double memory ratio = borrowAmount > 0 ? fraction(compAccrued, borrowAmount) : Double({mantissa: 0});
-            Double memory index = add_(Double({mantissa: borrowState.index}), ratio);
-            compBorrowState[cToken] = CompMarketState({
-                index: safe224(index.mantissa, "new index exceeds 224 bits"),
-                block: safe32(blockNumber, "block number exceeds 32 bits")
-            });
-        } else if (deltaBlocks > 0) {
-            borrowState.block = safe32(blockNumber, "block number exceeds 32 bits");
-        }
-    }
-
     // 为分发 COMP 奖励  -  borrow
     function distributeBorrowerComp(address cToken, address borrower, Exp memory marketBorrowIndex) internal {
         CompMarketState storage borrowState = compBorrowState[cToken];
@@ -1103,10 +1141,7 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         }
     }
 
-    /**
-     * @notice 计算自上次应计以来贡献者的额外应计 COMP
-     * @param贡献者计算贡献者奖励的地址
-     */
+    // 更新贡献者应该获取comp数量
     function updateContributorRewards(address contributor) public {
         uint compSpeed = compContributorSpeeds[contributor];
         uint blockNumber = getBlockNumber();
@@ -1120,12 +1155,12 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         }
     }
 
-    // 领取用户在所有市场的所有 COMP 奖励
+    // 领取用户在所有市场的所有 COMP 奖励（包含存款和借贷的comp奖励）
     function claimComp(address holder) public {
         return claimComp(holder, allMarkets);
     }
 
-    // 内部函数：领取指定市场中持有者累积的所有补偿
+    // 内部函数：领取用户在所有市场的所有 COMP 奖励（包含存款和借贷的comp奖励）
     // 参数：holder：接受地址、ctokens：领取 COMP 的市场列表
     function claimComp(address holder, CToken[] memory cTokens) public {
         address[] memory holders = new address[](1);
@@ -1133,14 +1168,10 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         claimComp(holders, cTokens, true, true);
     }
 
-    /**
-     * @notice 索取持有人累积的所有补偿
-     * @param持有者领取COMP的地址
-     * @param cTokens 领取 COMP 的市场列表
-     * @paramborrowers 是否领取借入所得的COMP
-     * @param供应商是否要求通过供应获得的COMP
-     */
+    // 内部函数：领取用户在所有市场的所有 COMP 奖励（包含存款和借贷的comp奖励）
+    // 参数：holders：领取人、cTokens：领取 COMP 的市场列表、borrowers：是否领取借入所得的COMP、suppliers：是否要求通过供应获得的COMP
     function claimComp(address[] memory holders, CToken[] memory cTokens, bool borrowers, bool suppliers) public {
+        // 遍历市场列表
         for (uint i = 0; i < cTokens.length; i++) {
             CToken cToken = cTokens[i];
             require(markets[address(cToken)].isListed, "market must be listed");
@@ -1162,7 +1193,7 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         }
     }
 
-    // 转移COMP代币
+    // 内部函数：转移COMP代币
     function grantCompInternal(address user, uint amount) internal returns (uint) {
         Comp comp = Comp(getCompAddress());
         uint compRemaining = comp.balanceOf(address(this));
@@ -1173,17 +1204,7 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         return amount;
     }
 
-    // =============================================================================================
-    //                                  Comp 奖励管理
-    // =============================================================================================
-
-    /**
-     * @notice 将 COMP 转移给接收者
-     * @dev 注意：如果没有足够的 COMP，我们不会执行全部传输。
-     * @paramrecipient要将COMP传输到的接收者的地址
-     * @param amount 要（可能）转移的 COMP 数量
-     */
-    // 直接授予COMP（管理员功能）
+    // 管理员 直接将COMP转移给 recipient
     function _grantComp(address recipient, uint amount) public {
         require(adminOrInitializing(), "only admin can grant comp");
         uint amountLeft = grantCompInternal(recipient, amount);
@@ -1191,38 +1212,9 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         emit CompGranted(recipient, amount);
     }
 
-    /**
-     * @notice 设置单一市场的 COMP 速度
-     * @param cToken COMP更新速度的市场
-     * @param compSpeed 面向市场的新 COMP 速度
-     */
-    // 设置市场的 COMP 发放速度
-    function _setCompSpeed(CToken cToken, uint compSpeed) public {
-        require(adminOrInitializing(), "only admin can set comp speed");
-        setCompSpeedInternal(cToken, compSpeed);
-    }
-
-    /**
-     * @notice 为单个贡献者设置 COMP 速度
-     * @param贡献者COMP更新速度的贡献者
-     * @param compSpeed 贡献者的新 COMP 速度
-     */
-    // 设置贡献者的 COMP 发放速度
-    function _setContributorCompSpeed(address contributor, uint compSpeed) public {
-        require(adminOrInitializing(), "only admin can set comp speed");
-
-        // note that COMP speed could be set to 0 to halt liquidity rewards for a contributor
-        updateContributorRewards(contributor);
-        if (compSpeed == 0) {
-            // release storage
-            delete lastContributorBlock[contributor];
-        } else {
-            lastContributorBlock[contributor] = getBlockNumber();
-        }
-        compContributorSpeeds[contributor] = compSpeed;
-
-        emit ContributorCompSpeedUpdated(contributor, compSpeed);
-    }
+    // =============================================================================================
+    //                                  其他功能
+    // =============================================================================================
 
     /**
      * @notice 返回所有市场
@@ -1233,6 +1225,7 @@ contract ComptrollerG7 is ComptrollerV5Storage, ComptrollerInterface, Comptrolle
         return allMarkets;
     }
 
+    // 获取最新区块
     function getBlockNumber() public view returns (uint) {
         return block.number;
     }
